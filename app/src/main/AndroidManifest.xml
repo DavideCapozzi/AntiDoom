@@ -14,7 +14,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.AntiDoom"
-        tools:targetApi="31">
+        tools:targetApi="34">
         
         <activity
             android:name=".ui.MainActivity"
@@ -33,7 +33,7 @@
             android:foregroundServiceType="specialUse">
             
             <property
-                android:name="android.app.property.FOREGROUND_SERVICE_TYPE_SPECIAL_USE_DESCRIPTION"
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Monitors scroll events for digital wellbeing tracking" />
                 
             <intent-filter>

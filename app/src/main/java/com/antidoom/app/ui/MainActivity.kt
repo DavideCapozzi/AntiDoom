@@ -30,18 +30,13 @@ import java.time.LocalDate
 
 class MainActivity : ComponentActivity() {
     
-    // Notification permission launcher for Android 13+
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { isGranted: Boolean ->
-        // Permission result handling (optional logging)
-    }
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
         checkAndRequestNotificationPermission()
-
         setContent {
             MaterialTheme {
                 Surface(
@@ -72,16 +67,16 @@ fun MainScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     
-    // State to track permission status (refreshes on app resume)
     var isAccessibilityEnabled by remember { mutableStateOf(checkAccessibilityService(context)) }
     var isOverlayEnabled by remember { mutableStateOf(checkOverlayPermission(context)) }
+    var currentDate by remember { mutableStateOf(LocalDate.now().toString()) }
 
-    // Observe lifecycle changes to refresh permission state when user returns from Settings
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isAccessibilityEnabled = checkAccessibilityService(context)
                 isOverlayEnabled = checkOverlayPermission(context)
+                currentDate = LocalDate.now().toString()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -90,13 +85,13 @@ fun MainScreen() {
         }
     }
     
-    // DB Access
     val db = remember { AppDatabase.get(context) }
-    val todayDistance by db.scrollDao()
-        .getDailyDistance(LocalDate.now().toString())
-        .collectAsState(initial = 0f)
-
-    val safeDistance = todayDistance ?: 0f
+    
+    val todayDistance by key(currentDate) {
+        db.scrollDao()
+            .getDailyDistance(currentDate)
+            .collectAsState(initial = 0f)
+    }
 
     Column(
         modifier = Modifier
@@ -114,7 +109,7 @@ fun MainScreen() {
         Spacer(modifier = Modifier.height(48.dp))
         
         Text(
-            text = String.format("%.2f m", safeDistance),
+            text = String.format("%.2f m", todayDistance),
             style = MaterialTheme.typography.displayLarge.copy(
                 fontWeight = FontWeight.Bold
             )
@@ -126,7 +121,6 @@ fun MainScreen() {
 
         Spacer(modifier = Modifier.height(64.dp))
 
-        // Accessibility Button
         SetupButton(
             text = if (isAccessibilityEnabled) "✅ Accessibility Active" else "1. Enable Accessibility",
             isEnabled = !isAccessibilityEnabled,
@@ -137,7 +131,6 @@ fun MainScreen() {
         
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Overlay Button
         SetupButton(
             text = if (isOverlayEnabled) "✅ Overlay Active" else "2. Enable Overlay Permission",
             isEnabled = !isOverlayEnabled,
@@ -161,7 +154,7 @@ fun MainScreen() {
 fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
-        enabled = isEnabled, // Disable button if permission is already granted
+        enabled = isEnabled,
         colors = ButtonDefaults.buttonColors(
             containerColor = if (isEnabled) MaterialTheme.colorScheme.primary else Color.Green.copy(alpha = 0.6f),
             disabledContainerColor = Color.Gray.copy(alpha = 0.2f),
@@ -175,14 +168,12 @@ fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-// Helper to check if Accessibility Service is running
 fun checkAccessibilityService(context: Context): Boolean {
     val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
     val enabledServices = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
     return enabledServices.any { it.resolveInfo.serviceInfo.packageName == context.packageName }
 }
 
-// Helper to check Overlay Permission
 fun checkOverlayPermission(context: Context): Boolean {
     return Settings.canDrawOverlays(context)
 }
@@ -191,7 +182,6 @@ fun openSettings(context: Context, action: String) {
     try {
         val intent = Intent(action).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            // Specific package handling for Overlay settings assists user navigation
             if (action == Settings.ACTION_MANAGE_OVERLAY_PERMISSION) {
                 data = android.net.Uri.parse("package:${context.packageName}")
             }

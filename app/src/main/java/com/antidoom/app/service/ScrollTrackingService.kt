@@ -3,8 +3,6 @@ package com.antidoom.app.service
 import android.accessibilityservice.AccessibilityService
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.content.Context
-import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -42,24 +40,20 @@ class ScrollTrackingService : AccessibilityService() {
     @Volatile
     private var trackedAppsCache: Set<String> = emptySet()
 
-    // Tracking State
     private var currentSessionDistance = 0f
     private var lastSavedDistance = 0f
     
-    // Overlay State
     private var isOverlayShowing = false
     private var currentOverlayView: View? = null
 
-    // SAFETY UPDATE: Buffered Channel with Drop Strategy to prevent OOM crashes
     private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
         capacity = 50,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
-    // Constants
     private val PIXELS_PER_METER = 3500f 
     private val LIMIT_METERS = 500f
-    private val SAVE_THRESHOLD_METERS = 10f 
+    private val SAVE_THRESHOLD_METERS = 100f 
 
     override fun onCreate() {
         super.onCreate()
@@ -90,7 +84,7 @@ class ScrollTrackingService : AccessibilityService() {
                 } catch (e: Exception) {
                     Log.e("AntiDoom", "Error processing scroll event", e)
                 } finally {
-                    try { event.recycle() } catch (e: Exception) { /* Ignore */ }
+                    try { event.recycle() } catch (e: Exception) { }
                 }
             }
         }
@@ -146,11 +140,9 @@ class ScrollTrackingService : AccessibilityService() {
         val pkgName = event.packageName?.toString() ?: return
         if (pkgName !in trackedAppsCache) return
 
-        // Create copy and try to send. If buffer is full, it drops oldest (safe).
         val eventCopy = AccessibilityEvent.obtain(event)
         val sent = scrollEventChannel.trySend(eventCopy to pkgName).isSuccess
         if (!sent) {
-            // Recycle immediately if dropped to avoid leak
             eventCopy.recycle()
         }
     }
@@ -181,7 +173,6 @@ class ScrollTrackingService : AccessibilityService() {
             }
         }
 
-        // LOGIC FIX: Update lastSavedDistance ONLY if save succeeds
         if (currentSessionDistance - lastSavedDistance >= SAVE_THRESHOLD_METERS) {
             val distanceToSave = currentSessionDistance - lastSavedDistance
             if (saveProgress(pkgName, distanceToSave)) {
@@ -251,7 +242,6 @@ class ScrollTrackingService : AccessibilityService() {
             
             removeOverlaySafe()
             
-            // Reset logic
             currentSessionDistance = 0f
             lastSavedDistance = 0f
             
