@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AntiDoom</string>
+    <string name="accessibility_desc">AntiDoom Scroll Tracker</string>
+</resources>
