@@ -108,7 +108,7 @@ fun MainScreen() {
         Spacer(modifier = Modifier.height(48.dp))
 
         Text(
-            text = String.format("%.2f m", todayDistance),
+            text = String.format(java.util.Locale.US, "%.2f m", todayDistance),
             style = MaterialTheme.typography.displayLarge.copy(
                 fontWeight = FontWeight.Bold
             )

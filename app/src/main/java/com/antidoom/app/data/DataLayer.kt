@@ -29,7 +29,7 @@ interface ScrollDao {
     fun getDailyDistance(date: String): Flow<Float>
 }
 
-@Database(entities = [ScrollSession::class], version = 1)
+@Database(entities = [ScrollSession::class], version = 1, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun scrollDao(): ScrollDao
 
@@ -43,15 +43,13 @@ abstract class AppDatabase : RoomDatabase() {
 
 val Context.dataStore by preferencesDataStore("settings")
 
-class UserPreferences(private val context: Context) {
-    private val TRACKED_APPS_KEY = stringSetPreferencesKey("tracked_apps")
+class UserPreferences(context: Context) {
 
+    private val trackedAppsKey = stringSetPreferencesKey("tracked_apps")
+
+    @Suppress("SpellCheckingInspection") // Fix: Ignora il typo su zhiliaoapp
     val trackedApps: Flow<Set<String>> = context.dataStore.data.map {
-        it[TRACKED_APPS_KEY] ?: setOf("com.instagram.android", "com.zhiliaoapp.musically", "com.google.android.youtube")
-    }
-
-    suspend fun addApp(pkg: String) {
-        context.dataStore.edit { it[TRACKED_APPS_KEY] = (it[TRACKED_APPS_KEY] ?: emptySet()) + pkg }
+        it[trackedAppsKey] ?: setOf("com.instagram.android", "com.zhiliaoapp.musically", "com.google.android.youtube")
     }
 }
 
@@ -63,7 +61,7 @@ class ScrollRepository private constructor(context: Context) {
     fun getDailyDistanceFlow(date: String): Flow<Float> {
         return db.scrollDao().getDailyDistance(date)
             .combine(_activeSessionDistance) { dbTotal, ramTotal ->
-                (dbTotal ?: 0f) + ramTotal
+                dbTotal + ramTotal
             }
     }
 

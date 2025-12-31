@@ -1,6 +1,7 @@
 package com.antidoom.app.service
 
 import android.accessibilityservice.AccessibilityService
+import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.pm.ServiceInfo
@@ -26,7 +27,14 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import kotlin.math.abs
 
+@Suppress("AccessibilityServiceInfo")
 class ScrollTrackingService : AccessibilityService() {
+
+    companion object {
+        private const val PIXELS_PER_METER = 3500f
+        private const val LIMIT_METERS_FOR_INTERVENTION = 500f
+        private const val FALLBACK_SCROLL_PIXELS = 1500
+    }
 
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
@@ -49,15 +57,10 @@ class ScrollTrackingService : AccessibilityService() {
     private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
         capacity = 50,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
-        onUndeliveredElement = { (event, _) ->
-            try { event.recycle() } catch (e: Exception) {}
+        onUndeliveredElement = {
+            // Channel cleanup if needed
         }
     )
-
-    private val PIXELS_PER_METER = 3500f
-    private val LIMIT_METERS_FOR_INTERVENTION = 500f
-
-    private val FALLBACK_SCROLL_PIXELS = 1500
 
     override fun onCreate() {
         super.onCreate()
@@ -88,8 +91,6 @@ class ScrollTrackingService : AccessibilityService() {
                     processScrollEvent(event, pkgName)
                 } catch (e: Exception) {
                     Log.e("AntiDoom", "Error processing scroll event", e)
-                } finally {
-                    try { event.recycle() } catch (e: Exception) { }
                 }
             }
         }
@@ -117,9 +118,7 @@ class ScrollTrackingService : AccessibilityService() {
         currentPackageName = pkgName
 
         val deltaY = getScrollDelta(event)
-
         val pixelsToAdd = if (deltaY > 0) deltaY else FALLBACK_SCROLL_PIXELS
-
         val meters = pixelsToAdd / PIXELS_PER_METER
 
         sessionAccumulatedMeters += meters
@@ -134,12 +133,8 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     private fun getScrollDelta(event: AccessibilityEvent): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val delta = abs(event.scrollDeltaY)
-            if (delta > 0) delta else 0
-        } else {
-            0
-        }
+        val delta = abs(event.scrollDeltaY)
+        return if (delta > 0) delta else 0
     }
 
     private fun startForegroundServiceSafe() {
@@ -185,6 +180,7 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
+    @Suppress("DEPRECATION")
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || isOverlayShowing) return
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) return
@@ -193,29 +189,21 @@ class ScrollTrackingService : AccessibilityService() {
         if (pkgName !in trackedAppsCache) return
 
         val eventCopy = AccessibilityEvent.obtain(event)
-        val sent = scrollEventChannel.trySend(eventCopy to pkgName).isSuccess
-        if (!sent) {
-            try { eventCopy.recycle() } catch (e: Exception) {}
-        }
+        scrollEventChannel.trySend(eventCopy to pkgName)
     }
 
-    private suspend fun triggerIntervention() {
+    @SuppressLint("SetTextI18n")
+    private fun triggerIntervention() {
         if (isOverlayShowing) return
         if (!Settings.canDrawOverlays(this)) return
 
         serviceScope.launch(Dispatchers.Main) {
             isOverlayShowing = true
 
-            val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            } else {
-                WindowManager.LayoutParams.TYPE_PHONE
-            }
-
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
-                layoutType,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
@@ -271,7 +259,7 @@ class ScrollTrackingService : AccessibilityService() {
             runBlocking {
                 try {
                     repository.flushSessionToDb(currentPackageName, sessionAccumulatedMeters)
-                } catch (e: Exception) { }
+                } catch (_: Exception) { }
             }
         }
         removeOverlaySafe()
