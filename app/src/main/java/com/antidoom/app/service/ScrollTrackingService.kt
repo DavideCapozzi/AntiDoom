@@ -3,7 +3,6 @@ package com.antidoom.app.service
 import android.accessibilityservice.AccessibilityService
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -13,6 +12,7 @@ import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.FrameLayout
@@ -24,6 +24,8 @@ import com.antidoom.app.data.AppDatabase
 import com.antidoom.app.data.ScrollSession
 import com.antidoom.app.data.UserPreferences
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import java.time.LocalDate
 import kotlin.math.abs
@@ -37,19 +39,27 @@ class ScrollTrackingService : AccessibilityService() {
     private lateinit var prefs: UserPreferences
     private lateinit var windowManager: WindowManager
     
-    // Efficient caching for package lookup (avoids IO on UI thread)
     @Volatile
     private var trackedAppsCache: Set<String> = emptySet()
 
     // Tracking State
     private var currentSessionDistance = 0f
     private var lastSavedDistance = 0f
-    private var isOverlayShowing = false
     
+    // Overlay State
+    private var isOverlayShowing = false
+    private var currentOverlayView: View? = null
+
+    // SAFETY UPDATE: Buffered Channel with Drop Strategy to prevent OOM crashes
+    private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
+        capacity = 50,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
     // Constants
     private val PIXELS_PER_METER = 3500f 
     private val LIMIT_METERS = 500f
-    private val SAVE_THRESHOLD_METERS = 10f // Save to DB every 10 meters
+    private val SAVE_THRESHOLD_METERS = 10f 
 
     override fun onCreate() {
         super.onCreate()
@@ -58,17 +68,31 @@ class ScrollTrackingService : AccessibilityService() {
             prefs = UserPreferences(applicationContext)
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
             
-            // Listen to preference changes safely
+            startEventConsumer()
+
             serviceScope.launch {
                 prefs.trackedApps.collectLatest { apps ->
                     trackedAppsCache = apps
-                    Log.d("AntiDoom", "Updated tracked apps: $apps")
                 }
             }
             
             startForegroundServiceSafe()
         } catch (e: Exception) {
             Log.e("AntiDoom", "Service initialization failed", e)
+        }
+    }
+
+    private fun startEventConsumer() {
+        serviceScope.launch {
+            for ((event, pkgName) in scrollEventChannel) {
+                try {
+                    processScrollEvent(event, pkgName)
+                } catch (e: Exception) {
+                    Log.e("AntiDoom", "Error processing scroll event", e)
+                } finally {
+                    try { event.recycle() } catch (e: Exception) { /* Ignore */ }
+                }
+            }
         }
     }
 
@@ -111,32 +135,28 @@ class ScrollTrackingService : AccessibilityService() {
                 startForeground(1, notification)
             }
         } catch (e: Exception) {
-            // On Android 12+, this might fail if app is in background. 
-            // We catch it to prevent a fatal crash.
             Log.e("AntiDoom", "Failed to start foreground service", e)
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || isOverlayShowing) return
-
-        // 1. Fast filter: check event type
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) return
 
-        // 2. Fast filter: check package name against cache
         val pkgName = event.packageName?.toString() ?: return
         if (pkgName !in trackedAppsCache) return
 
-        // 3. Offload calculation to background thread to keep Accessibility service responsive
-        serviceScope.launch {
-            processScrollEvent(event, pkgName)
+        // Create copy and try to send. If buffer is full, it drops oldest (safe).
+        val eventCopy = AccessibilityEvent.obtain(event)
+        val sent = scrollEventChannel.trySend(eventCopy to pkgName).isSuccess
+        if (!sent) {
+            // Recycle immediately if dropped to avoid leak
+            eventCopy.recycle()
         }
     }
 
     private suspend fun processScrollEvent(event: AccessibilityEvent, pkgName: String) {
         val deltaY = getScrollDelta(event)
-        
-        // Fallback heuristic: if delta is 0 but we scrolled, assume a small amount
         val pixelsToAdd = if (deltaY > 0) deltaY else 250 
         
         accumulateDistance(pixelsToAdd, pkgName)
@@ -155,31 +175,34 @@ class ScrollTrackingService : AccessibilityService() {
         val meters = pixels / PIXELS_PER_METER
         currentSessionDistance += meters
 
-        // Check for Intervention
         if (currentSessionDistance >= LIMIT_METERS) {
             withContext(Dispatchers.Main) {
                 triggerIntervention()
             }
         }
 
-        // Batch Database Writes (Performance Optimization)
+        // LOGIC FIX: Update lastSavedDistance ONLY if save succeeds
         if (currentSessionDistance - lastSavedDistance >= SAVE_THRESHOLD_METERS) {
-            saveProgress(pkgName)
-            lastSavedDistance = currentSessionDistance
+            val distanceToSave = currentSessionDistance - lastSavedDistance
+            if (saveProgress(pkgName, distanceToSave)) {
+                lastSavedDistance = currentSessionDistance
+            }
         }
     }
 
-    private suspend fun saveProgress(pkgName: String) {
-        try {
+    private suspend fun saveProgress(pkgName: String, distance: Float): Boolean {
+        return try {
             val session = ScrollSession(
                 packageName = pkgName,
-                distanceMeters = currentSessionDistance - lastSavedDistance, // Save delta
+                distanceMeters = distance,
                 timestamp = System.currentTimeMillis(),
                 date = LocalDate.now().toString()
             )
             db.scrollDao().insert(session)
+            true
         } catch (e: Exception) {
             Log.e("AntiDoom", "Database write failed", e)
+            false
         }
     }
 
@@ -206,7 +229,7 @@ class ScrollTrackingService : AccessibilityService() {
         )
 
         val overlayView = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#D9000000")) // 85% Black
+            setBackgroundColor(Color.parseColor("#D9000000")) 
             
             addView(TextView(context).apply {
                 text = "DOOMSCROLLING DETECTED\n\nTake a breath."
@@ -222,27 +245,43 @@ class ScrollTrackingService : AccessibilityService() {
 
         try {
             windowManager.addView(overlayView, params)
+            currentOverlayView = overlayView
             
-            // Force a break for 10 seconds
             delay(10_000)
             
-            windowManager.removeView(overlayView)
+            removeOverlaySafe()
+            
+            // Reset logic
             currentSessionDistance = 0f
             lastSavedDistance = 0f
-            isOverlayShowing = false
             
         } catch (e: Exception) {
             Log.e("AntiDoom", "Overlay failed", e)
-            isOverlayShowing = false // Reset flag to allow retries
+            removeOverlaySafe()
         }
     }
 
-    override fun onInterrupt() {
-        Log.w("AntiDoom", "Service Interrupted")
+    private fun removeOverlaySafe() {
+        try {
+            currentOverlayView?.let { view ->
+                if (view.isAttachedToWindow) {
+                    windowManager.removeView(view)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("AntiDoom", "Error removing overlay", e)
+        } finally {
+            currentOverlayView = null
+            isOverlayShowing = false
+        }
     }
 
+    override fun onInterrupt() { }
+
     override fun onDestroy() {
-        serviceScope.cancel() // Prevents memory leaks
+        removeOverlaySafe()
+        serviceScope.cancel() 
+        scrollEventChannel.close()
         super.onDestroy()
     }
 }
