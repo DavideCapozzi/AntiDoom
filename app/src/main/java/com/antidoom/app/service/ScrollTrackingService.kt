@@ -3,7 +3,9 @@ package com.antidoom.app.service
 import android.accessibilityservice.AccessibilityService
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -16,145 +18,177 @@ import android.view.accessibility.AccessibilityEvent
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.antidoom.app.R
 import com.antidoom.app.data.AppDatabase
 import com.antidoom.app.data.ScrollSession
 import com.antidoom.app.data.UserPreferences
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectLatest
 import java.time.LocalDate
 import kotlin.math.abs
 
 class ScrollTrackingService : AccessibilityService() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
+    
     private lateinit var db: AppDatabase
     private lateinit var prefs: UserPreferences
+    private lateinit var windowManager: WindowManager
     
-    // Cache for tracked apps to avoid IO operations on the UI/Accessibility thread
+    // Efficient caching for package lookup (avoids IO on UI thread)
     @Volatile
     private var trackedAppsCache: Set<String> = emptySet()
 
-    // Tracking Variables
+    // Tracking State
     private var currentSessionDistance = 0f
+    private var lastSavedDistance = 0f
     private var isOverlayShowing = false
-    private val PIXELS_PER_METER = 3500f // Approximate calibration
-    private val LIMIT_METERS = 500f // Trigger Intervention
+    
+    // Constants
+    private val PIXELS_PER_METER = 3500f 
+    private val LIMIT_METERS = 500f
+    private val SAVE_THRESHOLD_METERS = 10f // Save to DB every 10 meters
 
     override fun onCreate() {
         super.onCreate()
-        db = AppDatabase.get(applicationContext)
-        prefs = UserPreferences(applicationContext)
-        
-        // Start monitoring preferences in background.
-        // This updates the cache whenever the user changes settings, 
-        // allowing instant access in onAccessibilityEvent without database locking.
-        scope.launch {
-            prefs.trackedApps.collect { apps ->
-                trackedAppsCache = apps
-                Log.d("AntiDoom", "Tracked apps cache updated: $apps")
+        try {
+            db = AppDatabase.get(applicationContext)
+            prefs = UserPreferences(applicationContext)
+            windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            
+            // Listen to preference changes safely
+            serviceScope.launch {
+                prefs.trackedApps.collectLatest { apps ->
+                    trackedAppsCache = apps
+                    Log.d("AntiDoom", "Updated tracked apps: $apps")
+                }
             }
+            
+            startForegroundServiceSafe()
+        } catch (e: Exception) {
+            Log.e("AntiDoom", "Service initialization failed", e)
         }
-        
-        startForegroundSafe()
     }
 
-    private fun startForegroundSafe() {
-        val channelId = "antidoom_service"
+    private fun startForegroundServiceSafe() {
+        val channelId = "antidoom_service_channel"
         val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(channelId, "Tracking Service", NotificationManager.IMPORTANCE_LOW)
-        )
+        
+        if (manager.getNotificationChannel(channelId) == null) {
+            val channel = NotificationChannel(
+                channelId,
+                "AntiDoom Monitor",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Background scroll monitoring"
+            }
+            manager.createNotificationChannel(channel)
+        }
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("AntiDoom Active")
-            .setContentText("Monitoring scroll behavior")
+            .setContentText("Monitoring your digital wellbeing")
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .build()
 
-        // Ensure compatibility with Android 14 foreground service types
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(1, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceCompat.startForeground(
+                    this,
+                    1,
+                    notification,
+                    if (Build.VERSION.SDK_INT >= 34) {
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    } else {
+                        0
+                    }
+                )
+            } else {
+                startForeground(1, notification)
+            }
+        } catch (e: Exception) {
+            // On Android 12+, this might fail if app is in background. 
+            // We catch it to prevent a fatal crash.
+            Log.e("AntiDoom", "Failed to start foreground service", e)
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || isOverlayShowing) return
 
-        // CRITICAL PERFORMANCE FIX:
-        // Do not launch a coroutine or do any heavy lifting if the event is not relevant.
-        // 1. Filter by Event Type (ignore window changes, focus changes, etc.)
+        // 1. Fast filter: check event type
         if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) return
 
-        // 2. Filter by Package Name using the in-memory cache (zero IO latency)
-        val pkgName = event.packageName?.toString()
-        if (pkgName == null || pkgName !in trackedAppsCache) return
+        // 2. Fast filter: check package name against cache
+        val pkgName = event.packageName?.toString() ?: return
+        if (pkgName !in trackedAppsCache) return
 
-        // If we passed the filters, process the scroll in a background thread
-        scope.launch {
-            processScroll(event)
+        // 3. Offload calculation to background thread to keep Accessibility service responsive
+        serviceScope.launch {
+            processScrollEvent(event, pkgName)
         }
     }
 
-    private suspend fun processScroll(event: AccessibilityEvent) {
-        // Attempt to calculate precise delta
-        val deltaY = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-             // API 28+ precise delta
-             if (event.scrollDeltaY != 0) {
-                 abs(event.scrollDeltaY)
-             } else {
-                 0
-             }
+    private suspend fun processScrollEvent(event: AccessibilityEvent, pkgName: String) {
+        val deltaY = getScrollDelta(event)
+        
+        // Fallback heuristic: if delta is 0 but we scrolled, assume a small amount
+        val pixelsToAdd = if (deltaY > 0) deltaY else 250 
+        
+        accumulateDistance(pixelsToAdd, pkgName)
+    }
+
+    private fun getScrollDelta(event: AccessibilityEvent): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val delta = abs(event.scrollDeltaY)
+            if (delta > 0) delta else 0
         } else {
             0
         }
-
-        // Logic: If delta is 0 but we received a SCROLL event, use a fallback heuristic.
-        // This often happens in webviews or custom views that don't report delta.
-        val pixelsToAdd = if (deltaY > 0) deltaY else 200
-
-        accumulate(pixelsToAdd)
-        
-        // Don't forget to recycle if you obtained a copy, 
-        // but here 'event' is passed by system, usually safe to just read.
     }
 
-    private suspend fun accumulate(pixels: Int) {
+    private suspend fun accumulateDistance(pixels: Int, pkgName: String) {
         val meters = pixels / PIXELS_PER_METER
         currentSessionDistance += meters
-        
-        // Log sparingly in production to avoid logcat spam
-        // Log.d("AntiDoom", "Distance: $currentSessionDistance m")
 
+        // Check for Intervention
         if (currentSessionDistance >= LIMIT_METERS) {
-            withContext(Dispatchers.Main) { showPunishmentOverlay() }
+            withContext(Dispatchers.Main) {
+                triggerIntervention()
+            }
         }
-        
-        // Save periodically (Debouncing could be improved here, but this is functional)
-        if (currentSessionDistance % 10 < 0.5) {
-            saveToDb()
+
+        // Batch Database Writes (Performance Optimization)
+        if (currentSessionDistance - lastSavedDistance >= SAVE_THRESHOLD_METERS) {
+            saveProgress(pkgName)
+            lastSavedDistance = currentSessionDistance
         }
-    }
-    
-    private suspend fun saveToDb() {
-        val today = LocalDate.now().toString()
-        db.scrollDao().insert(ScrollSession(
-            packageName = "tracked.app", // Consider passing actual package name
-            distanceMeters = currentSessionDistance,
-            timestamp = System.currentTimeMillis(),
-            date = today
-        ))
     }
 
-    private suspend fun showPunishmentOverlay() {
+    private suspend fun saveProgress(pkgName: String) {
+        try {
+            val session = ScrollSession(
+                packageName = pkgName,
+                distanceMeters = currentSessionDistance - lastSavedDistance, // Save delta
+                timestamp = System.currentTimeMillis(),
+                date = LocalDate.now().toString()
+            )
+            db.scrollDao().insert(session)
+        } catch (e: Exception) {
+            Log.e("AntiDoom", "Database write failed", e)
+        }
+    }
+
+    private suspend fun triggerIntervention() {
+        if (isOverlayShowing) return
         if (!Settings.canDrawOverlays(this)) return
+
         isOverlayShowing = true
         
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        
-        // Use TYPE_APPLICATION_OVERLAY for Android O+
         val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -165,47 +199,50 @@ class ScrollTrackingService : AccessibilityService() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             layoutType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or 
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or 
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         )
 
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#EE000000")) // Semi-transparent black
+        val overlayView = FrameLayout(this).apply {
+            setBackgroundColor(Color.parseColor("#D9000000")) // 85% Black
+            
             addView(TextView(context).apply {
-                text = "DOOMSCROLLING DETECTED\nTake a breath."
+                text = "DOOMSCROLLING DETECTED\n\nTake a breath."
                 setTextColor(Color.WHITE)
-                textSize = 24f
+                textSize = 28f
                 gravity = Gravity.CENTER
                 layoutParams = FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT, 
+                    FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT
                 )
             })
         }
 
         try {
-            wm.addView(overlay, params)
-            // Block usage for 10 seconds
-            delay(10_000)
-            wm.removeView(overlay)
+            windowManager.addView(overlayView, params)
             
-            // Reset counters
+            // Force a break for 10 seconds
+            delay(10_000)
+            
+            windowManager.removeView(overlayView)
             currentSessionDistance = 0f
+            lastSavedDistance = 0f
             isOverlayShowing = false
+            
         } catch (e: Exception) {
-            Log.e("AntiDoom", "Overlay error", e)
-            isOverlayShowing = false
+            Log.e("AntiDoom", "Overlay failed", e)
+            isOverlayShowing = false // Reset flag to allow retries
         }
     }
 
     override fun onInterrupt() {
-        // Service interrupted by system
+        Log.w("AntiDoom", "Service Interrupted")
     }
 
     override fun onDestroy() {
-        scope.cancel()
+        serviceScope.cancel() // Prevents memory leaks
         super.onDestroy()
     }
 }
