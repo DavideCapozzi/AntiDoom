@@ -43,12 +43,20 @@ class ScrollTrackingService : AccessibilityService() {
     private var currentSessionDistance = 0f
     private var lastSavedDistance = 0f
     
+    @Volatile
     private var isOverlayShowing = false
     private var currentOverlayView: View? = null
 
     private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
         capacity = 50,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        onUndeliveredElement = { (event, _) ->
+            try {
+                event.recycle()
+            } catch (e: Exception) {
+                // Ignore if already recycled
+            }
+        }
     )
 
     private val PIXELS_PER_METER = 3500f 
@@ -141,9 +149,10 @@ class ScrollTrackingService : AccessibilityService() {
         if (pkgName !in trackedAppsCache) return
 
         val eventCopy = AccessibilityEvent.obtain(event)
+        
         val sent = scrollEventChannel.trySend(eventCopy to pkgName).isSuccess
         if (!sent) {
-            eventCopy.recycle()
+            try { eventCopy.recycle() } catch (e: Exception) {}
         }
     }
 
@@ -168,9 +177,9 @@ class ScrollTrackingService : AccessibilityService() {
         currentSessionDistance += meters
 
         if (currentSessionDistance >= LIMIT_METERS) {
-            withContext(Dispatchers.Main) {
-                triggerIntervention()
-            }
+            currentSessionDistance = 0f
+            lastSavedDistance = 0f
+            triggerIntervention()
         }
 
         if (currentSessionDistance - lastSavedDistance >= SAVE_THRESHOLD_METERS) {
@@ -201,53 +210,52 @@ class ScrollTrackingService : AccessibilityService() {
         if (isOverlayShowing) return
         if (!Settings.canDrawOverlays(this)) return
 
-        isOverlayShowing = true
-        
-        val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
+        serviceScope.launch(Dispatchers.Main) {
+            isOverlayShowing = true
+            
+            val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                WindowManager.LayoutParams.TYPE_PHONE
+            }
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            layoutType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        )
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                layoutType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
 
-        val overlayView = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#D9000000")) 
-            
-            addView(TextView(context).apply {
-                text = "DOOMSCROLLING DETECTED\n\nTake a breath."
-                setTextColor(Color.WHITE)
-                textSize = 28f
-                gravity = Gravity.CENTER
-                layoutParams = FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                )
-            })
-        }
+            val overlayView = FrameLayout(this@ScrollTrackingService).apply {
+                setBackgroundColor(Color.parseColor("#D9000000")) 
+                
+                addView(TextView(context).apply {
+                    text = "DOOMSCROLLING DETECTED\n\nTake a breath."
+                    setTextColor(Color.WHITE)
+                    textSize = 28f
+                    gravity = Gravity.CENTER
+                    layoutParams = FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                })
+            }
 
-        try {
-            windowManager.addView(overlayView, params)
-            currentOverlayView = overlayView
-            
-            delay(10_000)
-            
-            removeOverlaySafe()
-            
-            currentSessionDistance = 0f
-            lastSavedDistance = 0f
-            
-        } catch (e: Exception) {
-            Log.e("AntiDoom", "Overlay failed", e)
-            removeOverlaySafe()
+            try {
+                windowManager.addView(overlayView, params)
+                currentOverlayView = overlayView
+                
+                delay(10_000)
+                
+                removeOverlaySafe()
+                
+            } catch (e: Exception) {
+                Log.e("AntiDoom", "Overlay failed", e)
+                removeOverlaySafe()
+            }
         }
     }
 
