@@ -25,11 +25,11 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import com.antidoom.app.data.AppDatabase
+import com.antidoom.app.data.ScrollRepository
 import java.time.LocalDate
 
 class MainActivity : ComponentActivity() {
-    
+
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -66,7 +66,7 @@ class MainActivity : ComponentActivity() {
 fun MainScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    
+
     var isAccessibilityEnabled by remember { mutableStateOf(checkAccessibilityService(context)) }
     var isOverlayEnabled by remember { mutableStateOf(checkOverlayPermission(context)) }
     var currentDate by remember { mutableStateOf(LocalDate.now().toString()) }
@@ -84,12 +84,11 @@ fun MainScreen() {
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
-    
-    val db = remember { AppDatabase.get(context) }
-    
+
+    val repository = remember { ScrollRepository.get(context) }
+
     val todayDistance by key(currentDate) {
-        db.scrollDao()
-            .getDailyDistance(currentDate)
+        repository.getDailyDistanceFlow(currentDate)
             .collectAsState(initial = 0f)
     }
 
@@ -105,9 +104,9 @@ fun MainScreen() {
             style = MaterialTheme.typography.headlineMedium,
             color = MaterialTheme.colorScheme.primary
         )
-        
+
         Spacer(modifier = Modifier.height(48.dp))
-        
+
         Text(
             text = String.format("%.2f m", todayDistance),
             style = MaterialTheme.typography.displayLarge.copy(
@@ -128,7 +127,7 @@ fun MainScreen() {
                 openSettings(context, Settings.ACTION_ACCESSIBILITY_SETTINGS)
             }
         )
-        
+
         Spacer(modifier = Modifier.height(16.dp))
 
         SetupButton(
@@ -138,7 +137,7 @@ fun MainScreen() {
                 openSettings(context, Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
             }
         )
-        
+
         if (isAccessibilityEnabled && isOverlayEnabled) {
             Spacer(modifier = Modifier.height(32.dp))
             Text(
