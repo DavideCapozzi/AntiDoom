@@ -1,9 +1,11 @@
 package com.antidoom.app.service
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -14,8 +16,11 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.antidoom.app.R
@@ -25,6 +30,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import java.time.LocalDate
 import kotlin.math.abs
 
 @Suppress("AccessibilityServiceInfo")
@@ -32,8 +39,14 @@ class ScrollTrackingService : AccessibilityService() {
 
     companion object {
         private const val PIXELS_PER_METER = 3500f
-        private const val LIMIT_METERS_FOR_INTERVENTION = 500f
         private const val FALLBACK_SCROLL_PIXELS = 1500
+
+        // Configurable limits
+        private const val DAILY_LIMIT_METERS = 100f // Hard block limit
+        private const val WARNING_THRESHOLD_METERS = 50f // Warning limit
+
+        // Time in ms to ignore events after exiting to Home
+        private const val EXIT_GRACE_PERIOD_MS = 2000L
     }
 
     private val serviceJob = SupervisorJob()
@@ -43,23 +56,30 @@ class ScrollTrackingService : AccessibilityService() {
     private lateinit var prefs: UserPreferences
     private lateinit var windowManager: WindowManager
 
-    @Volatile
-    private var trackedAppsCache: Set<String> = emptySet()
+    // State Tracking
+    @Volatile private var trackedAppsCache: Set<String> = emptySet()
+    @Volatile private var currentDailyTotal: Float = 0f
 
-    private var currentPackageName: String = ""
+    // Tracks the last external package (ignoring the overlay itself)
+    private var currentAppPackage: String = ""
+
+    // Timestamp of the last forced exit to handle transition lag
+    private var lastExitTimestamp: Long = 0L
+
+    // Accumulators
     private var sessionAccumulatedMeters = 0f
-    private var interventionAccumulatedMeters = 0f
 
-    @Volatile
-    private var isOverlayShowing = false
+    // UI State
+    @Volatile private var isOverlayShowing = false
     private var currentOverlayView: View? = null
+    private var hasWarnedToday = false
+
+    // Date for daily reset
+    private var lastCheckDate: String = ""
 
     private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
         capacity = 50,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
-        onUndeliveredElement = {
-            // Channel cleanup if needed
-        }
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
     override fun onCreate() {
@@ -68,9 +88,11 @@ class ScrollTrackingService : AccessibilityService() {
             repository = ScrollRepository.get(applicationContext)
             prefs = UserPreferences(applicationContext)
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            lastCheckDate = LocalDate.now().toString()
 
             startEventConsumer()
             startPeriodicFlushing()
+            startStateObservation()
 
             serviceScope.launch {
                 prefs.trackedApps.collectLatest { apps ->
@@ -84,14 +106,213 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
+    private fun startStateObservation() {
+        serviceScope.launch {
+            while (isActive) {
+                val today = LocalDate.now().toString()
+                if (today != lastCheckDate) {
+                    hasWarnedToday = false
+                    lastCheckDate = today
+                }
+
+                repository.getDailyDistanceFlow(today)
+                    .distinctUntilChanged()
+                    .collectLatest { total ->
+                        currentDailyTotal = total
+                        checkEnforcementState()
+                    }
+            }
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        val info = serviceInfo
+        // Listen for Scroll events and Window state changes (App switching)
+        info.eventTypes = AccessibilityEvent.TYPE_VIEW_SCROLLED or AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+        serviceInfo = info
+    }
+
     private fun startEventConsumer() {
         serviceScope.launch {
             for ((event, pkgName) in scrollEventChannel) {
                 try {
-                    processScrollEvent(event, pkgName)
+                    processScrollEvent(event)
                 } catch (e: Exception) {
                     Log.e("AntiDoom", "Error processing scroll event", e)
                 }
+            }
+        }
+    }
+
+    private suspend fun processScrollEvent(event: AccessibilityEvent) {
+        val deltaY = getScrollDelta(event)
+        val pixelsToAdd = if (deltaY > 0) deltaY else FALLBACK_SCROLL_PIXELS
+        val meters = pixelsToAdd / PIXELS_PER_METER
+
+        sessionAccumulatedMeters += meters
+        repository.updateActiveDistance(sessionAccumulatedMeters)
+    }
+
+    private fun getScrollDelta(event: AccessibilityEvent): Int {
+        val delta = abs(event.scrollDeltaY)
+        return if (delta > 0) delta else 0
+    }
+
+    /**
+     * CORE LOGIC: Decides whether to show Warning or Block
+     */
+    private fun checkEnforcementState() {
+        // --- GRACE PERIOD CHECK ---
+        // If we recently forced an exit, ignore all checks for a few seconds.
+        // This prevents buffered events or rapid focus switches from re-triggering the block.
+        if (System.currentTimeMillis() - lastExitTimestamp < EXIT_GRACE_PERIOD_MS) {
+            return
+        }
+
+        // If not in a tracked app, remove everything and exit
+        if (currentAppPackage !in trackedAppsCache) {
+            removeOverlaySafe()
+            return
+        }
+
+        // 1. Warning Logic (50%)
+        if (currentDailyTotal >= WARNING_THRESHOLD_METERS &&
+            !hasWarnedToday &&
+            currentDailyTotal < DAILY_LIMIT_METERS) {
+
+            hasWarnedToday = true
+            showWarningToast()
+        }
+
+        // 2. Blocking Logic (100%)
+        if (currentDailyTotal >= DAILY_LIMIT_METERS) {
+            if (!isOverlayShowing) {
+                showBlockingOverlay()
+            }
+        } else {
+            if (isOverlayShowing) {
+                removeOverlaySafe()
+            }
+        }
+    }
+
+    private fun showWarningToast() {
+        serviceScope.launch(Dispatchers.Main) {
+            Toast.makeText(
+                applicationContext,
+                "⚠️ AntiDoom: 50% limit reached!",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun showBlockingOverlay() {
+        if (isOverlayShowing) return
+        if (!Settings.canDrawOverlays(this)) return
+
+        serviceScope.launch(Dispatchers.Main) {
+            // Double check to prevent race conditions
+            if (isOverlayShowing) return@launch
+
+            isOverlayShowing = true
+
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_DIM_BEHIND,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                dimAmount = 0.95f
+                gravity = Gravity.CENTER
+            }
+
+            val overlayView = FrameLayout(this@ScrollTrackingService).apply {
+                setBackgroundColor(Color.parseColor("#F2000000"))
+
+                val container = LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    layoutParams = FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        Gravity.CENTER
+                    )
+                }
+
+                val title = TextView(context).apply {
+                    text = "⛔ LIMIT REACHED"
+                    setTextColor(Color.RED)
+                    textSize = 28f
+                    gravity = Gravity.CENTER
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                }
+
+                val message = TextView(context).apply {
+                    text = "You've exhausted your scroll budget for today.\n\nTake a breath."
+                    setTextColor(Color.WHITE)
+                    textSize = 18f
+                    gravity = Gravity.CENTER
+                    setPadding(32, 32, 32, 64)
+                }
+
+                val exitButton = Button(context).apply {
+                    text = "GO TO HOME SCREEN"
+                    setBackgroundColor(Color.WHITE)
+                    setTextColor(Color.BLACK)
+                    setOnClickListener {
+                        // --- CRITICAL FIX FOR GHOST OVERLAY ---
+
+                        // 1. Activate Grace Period
+                        lastExitTimestamp = System.currentTimeMillis()
+
+                        // 2. Force clear current package memory
+                        currentAppPackage = ""
+
+                        // 3. Remove overlay immediately
+                        removeOverlaySafe()
+
+                        // 4. Perform global action
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                    }
+                }
+
+                container.addView(title)
+                container.addView(message)
+                container.addView(exitButton)
+                addView(container)
+            }
+
+            try {
+                windowManager.addView(overlayView, params)
+                currentOverlayView = overlayView
+            } catch (e: Exception) {
+                Log.e("AntiDoom", "Overlay failed", e)
+                isOverlayShowing = false
+            }
+        }
+    }
+
+    private fun removeOverlaySafe() {
+        if (!isOverlayShowing) return
+
+        serviceScope.launch(Dispatchers.Main) {
+            try {
+                currentOverlayView?.let { view ->
+                    if (view.isAttachedToWindow) {
+                        windowManager.removeView(view)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("AntiDoom", "Error removing overlay", e)
+            } finally {
+                currentOverlayView = null
+                isOverlayShowing = false
             }
         }
     }
@@ -106,35 +327,42 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     private suspend fun flushCurrentSession() {
-        if (sessionAccumulatedMeters > 0 && currentPackageName.isNotEmpty()) {
+        if (sessionAccumulatedMeters > 0 && currentAppPackage.isNotEmpty()) {
             val metersToSave = sessionAccumulatedMeters
             sessionAccumulatedMeters = 0f
-
-            repository.flushSessionToDb(currentPackageName, metersToSave)
+            repository.flushSessionToDb(currentAppPackage, metersToSave)
         }
     }
 
-    private suspend fun processScrollEvent(event: AccessibilityEvent, pkgName: String) {
-        currentPackageName = pkgName
+    @Suppress("DEPRECATION")
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
 
-        val deltaY = getScrollDelta(event)
-        val pixelsToAdd = if (deltaY > 0) deltaY else FALLBACK_SCROLL_PIXELS
-        val meters = pixelsToAdd / PIXELS_PER_METER
+        val pkgName = event.packageName?.toString() ?: return
 
-        sessionAccumulatedMeters += meters
-        interventionAccumulatedMeters += meters
+        // Ignore events from our own overlay/app
+        if (pkgName == packageName) return
 
-        repository.updateActiveDistance(sessionAccumulatedMeters)
-
-        if (interventionAccumulatedMeters >= LIMIT_METERS_FOR_INTERVENTION) {
-            interventionAccumulatedMeters = 0f
-            triggerIntervention()
+        // 1. APP SWITCHING
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            currentAppPackage = pkgName
+            checkEnforcementState()
+            return
         }
-    }
 
-    private fun getScrollDelta(event: AccessibilityEvent): Int {
-        val delta = abs(event.scrollDeltaY)
-        return if (delta > 0) delta else 0
+        // 2. SCROLLING
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (pkgName !in trackedAppsCache) return
+
+            // If overlay is showing, just ensure it stays showing (unless in grace period)
+            if (isOverlayShowing) {
+                checkEnforcementState()
+                return
+            }
+
+            val eventCopy = AccessibilityEvent.obtain(event)
+            scrollEventChannel.trySend(eventCopy to pkgName)
+        }
     }
 
     private fun startForegroundServiceSafe() {
@@ -180,85 +408,13 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
-    @Suppress("DEPRECATION")
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null || isOverlayShowing) return
-        if (event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) return
-
-        val pkgName = event.packageName?.toString() ?: return
-        if (pkgName !in trackedAppsCache) return
-
-        val eventCopy = AccessibilityEvent.obtain(event)
-        scrollEventChannel.trySend(eventCopy to pkgName)
-    }
-
-    @SuppressLint("SetTextI18n")
-    private fun triggerIntervention() {
-        if (isOverlayShowing) return
-        if (!Settings.canDrawOverlays(this)) return
-
-        serviceScope.launch(Dispatchers.Main) {
-            isOverlayShowing = true
-
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                PixelFormat.TRANSLUCENT
-            )
-
-            val overlayView = FrameLayout(this@ScrollTrackingService).apply {
-                setBackgroundColor(Color.parseColor("#D9000000"))
-
-                addView(TextView(context).apply {
-                    text = "DOOMSCROLLING DETECTED\n\nTake a breath."
-                    setTextColor(Color.WHITE)
-                    textSize = 28f
-                    gravity = Gravity.CENTER
-                    layoutParams = FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.MATCH_PARENT
-                    )
-                })
-            }
-
-            try {
-                windowManager.addView(overlayView, params)
-                currentOverlayView = overlayView
-                delay(10_000)
-                removeOverlaySafe()
-            } catch (e: Exception) {
-                Log.e("AntiDoom", "Overlay failed", e)
-                removeOverlaySafe()
-            }
-        }
-    }
-
-    private fun removeOverlaySafe() {
-        try {
-            currentOverlayView?.let { view ->
-                if (view.isAttachedToWindow) {
-                    windowManager.removeView(view)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("AntiDoom", "Error removing overlay", e)
-        } finally {
-            currentOverlayView = null
-            isOverlayShowing = false
-        }
-    }
-
     override fun onInterrupt() { }
 
     override fun onDestroy() {
         if (sessionAccumulatedMeters > 0) {
             runBlocking {
                 try {
-                    repository.flushSessionToDb(currentPackageName, sessionAccumulatedMeters)
+                    repository.flushSessionToDb(currentAppPackage, sessionAccumulatedMeters)
                 } catch (_: Exception) { }
             }
         }
