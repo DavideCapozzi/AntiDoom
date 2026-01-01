@@ -40,19 +40,14 @@ class ScrollTrackingService : AccessibilityService() {
     companion object {
         private const val PIXELS_PER_METER = 3500f
         private const val FALLBACK_SCROLL_PIXELS = 1500
-
-        // --- INTERVENTION THRESHOLDS ---
         private const val LIMIT_HARD_METERS = 100f   // 100% - Stop
         private const val LIMIT_SOFT_METERS = 50f    // 50%  - Pause/Intervene
         private const val LIMIT_WARNING_METERS = 25f // 25%  - Toast Warning
-
-        // Grace period is still useful for UX, but NOT for logic correctness
         private const val EXIT_GRACE_PERIOD_MS = 2000L
     }
 
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
-
     private lateinit var repository: ScrollRepository
     private lateinit var prefs: UserPreferences
     private lateinit var windowManager: WindowManager
@@ -135,7 +130,6 @@ class ScrollTrackingService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         val info = serviceInfo
-        // We need retrieve window content to verify the active window
         info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         info.eventTypes = AccessibilityEvent.TYPE_VIEW_SCROLLED or AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
@@ -424,10 +418,6 @@ class ScrollTrackingService : AccessibilityService() {
             // If we are in the grace period, we trust the "Go Home" action
             // and ignore temporary flickers from the closing app.
             if (System.currentTimeMillis() - lastExitTimestamp < EXIT_GRACE_PERIOD_MS) {
-                // OPTIONAL: We could double check here if pkgName is NOT a tracked app
-                // (e.g. Launcher), then we could accept it.
-                // But safer to just wait for the grace period or let checkEnforcementState
-                // handle the "Sanity Check".
                 return
             }
 
