@@ -20,6 +20,10 @@ data class ScrollSession(
     val date: String
 )
 
+data class AppDistanceTuple(
+    @ColumnInfo(name = "packageName") val packageName: String,
+    @ColumnInfo(name = "total") val total: Float
+)
 @Dao
 interface ScrollDao {
     @Insert
@@ -27,6 +31,9 @@ interface ScrollDao {
 
     @Query("SELECT COALESCE(SUM(distanceMeters), 0) FROM scroll_sessions WHERE date = :date")
     fun getDailyDistance(date: String): Flow<Float>
+
+    @Query("SELECT packageName, COALESCE(SUM(distanceMeters), 0) as total FROM scroll_sessions WHERE date = :date GROUP BY packageName")
+    fun getDailyBreakdown(date: String): Flow<List<AppDistanceTuple>>
 }
 
 @Database(entities = [ScrollSession::class], version = 1, exportSchema = false)
@@ -48,6 +55,8 @@ class UserPreferences(private val context: Context) {
     // Whitelist approach: Only apps in this set are tracked
     private val trackedAppsKey = stringSetPreferencesKey("tracked_apps")
     private val dailyLimitKey = floatPreferencesKey("daily_limit_meters")
+    private val lockedUntilKey = longPreferencesKey("locked_until_ts")
+    private val appLimitsKey = stringPreferencesKey("app_limits_json")
 
     // Default CORE apps enabled out-of-the-box
     private val defaultCoreApps = setOf(
@@ -79,6 +88,55 @@ class UserPreferences(private val context: Context) {
         context.dataStore.edit { preferences ->
             preferences[trackedAppsKey] = apps
         }
+    }
+
+    val isSettingsLocked: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        val until = prefs[lockedUntilKey] ?: 0L
+        System.currentTimeMillis() < until
+    }
+
+    val appLimits: Flow<Map<String, Float>> = context.dataStore.data.map { prefs ->
+        val json = prefs[appLimitsKey] ?: "{}"
+        parseAppLimits(json)
+    }
+
+    suspend fun setLock(durationMs: Long) {
+        context.dataStore.edit { prefs ->
+            prefs[lockedUntilKey] = System.currentTimeMillis() + durationMs
+        }
+    }
+
+    suspend fun updateAppLimit(packageName: String, limit: Float?) {
+        context.dataStore.edit { prefs ->
+            val currentJson = prefs[appLimitsKey] ?: "{}"
+            val currentMap = parseAppLimits(currentJson).toMutableMap()
+            if (limit == null) {
+                currentMap.remove(packageName)
+            } else {
+                currentMap[packageName] = limit
+            }
+            prefs[appLimitsKey] = formatAppLimits(currentMap)
+        }
+    }
+
+    // Simple manual JSON parser/formatter to avoid adding Gson/Moshi dependency for this simple task
+    private fun parseAppLimits(json: String): Map<String, Float> {
+        if (json == "{}" || json.isEmpty()) return emptyMap()
+        val map = mutableMapOf<String, Float>()
+        try {
+            // format: "pkg1:100.0,pkg2:50.0"
+            json.split(",").forEach { entry ->
+                val parts = entry.split(":")
+                if (parts.size == 2) {
+                    map[parts[0]] = parts[1].toFloatOrNull() ?: 0f
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+        return map
+    }
+
+    private fun formatAppLimits(map: Map<String, Float>): String {
+        return map.entries.joinToString(",") { "${it.key}:${it.value}" }
     }
 }
 
@@ -114,6 +172,20 @@ class ScrollRepository private constructor(context: Context) {
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    fun getDailyAppDistancesFlow(date: String): Flow<Map<String, Float>> {
+        return db.scrollDao().getDailyBreakdown(date)
+            .combine(_activeSessionDistance) { dbList, sessionDist ->
+                // Convert DB list to map
+                val map = dbList.associate { it.packageName to it.total }.toMutableMap()
+
+                // Add current active session to the specific app entry (this logic requires knowing CURRENT app in repo,
+                // but for simplicity, we usually flush often. However, to be precise, we can't easily attribute
+                // _activeSessionDistance to a specific package here without passing the package name.
+                // For the Service logic, we will handle the active session addition manually there.)
+                map
+            }
     }
 
     companion object {

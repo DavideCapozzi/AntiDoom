@@ -49,6 +49,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import coil.compose.rememberAsyncImagePainter
+import android.widget.Toast
 
 // Navigation Routes
 sealed class Screen(val route: String, val label: String? = null, val icon: ImageVector? = null) {
@@ -215,40 +216,6 @@ fun SettingsItem(title: String, subtitle: String, icon: ImageVector, onClick: ()
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun LimitSettingsScreen(navController: NavController) {
-    val context = LocalContext.current
-    val prefs = remember { UserPreferences(context) }
-    val scope = rememberCoroutineScope()
-    val currentLimit by prefs.dailyLimit.collectAsState(initial = 100f)
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Limits") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
-                    }
-                }
-            )
-        }
-    ) { p ->
-        Column(modifier = Modifier.padding(p).padding(24.dp)) {
-            Text("Daily Limit: ${currentLimit.toInt()} meters", style = MaterialTheme.typography.headlineSmall)
-            Spacer(modifier = Modifier.height(24.dp))
-            Slider(
-                value = currentLimit,
-                onValueChange = { scope.launch { prefs.updateDailyLimit(it) } },
-                valueRange = 10f..500f,
-                steps = 48
-            )
-            Text("Adjust the slider to set your goal.", style = MaterialTheme.typography.bodyMedium)
-        }
-    }
-}
-
 data class AppInfo(
     val label: String,
     val packageName: String,
@@ -261,6 +228,7 @@ fun AppsSettingsScreen(navController: NavController) {
     val context = LocalContext.current
     val prefs = remember { UserPreferences(context) }
     val scope = rememberCoroutineScope()
+    val isLocked by prefs.isSettingsLocked.collectAsState(initial = false)
 
     // Whitelist: Apps in this list ARE tracked
     val trackedApps by prefs.trackedApps.collectAsState(initial = emptySet())
@@ -335,7 +303,11 @@ fun AppsSettingsScreen(navController: NavController) {
                         }
                     }
                     items(coreAppsList, key = { it.packageName }) { app ->
-                        AppItem(app, app.packageName in trackedApps) { isChecked ->
+                        AppItem(app, app.packageName in trackedApps, isLocked) { isChecked -> // Pass isLocked
+                            if (isLocked) {
+                                Toast.makeText(context, "Settings locked for 24h", Toast.LENGTH_SHORT).show()
+                                return@AppItem
+                            }
                             scope.launch {
                                 val newSet = if (isChecked) trackedApps + app.packageName else trackedApps - app.packageName
                                 prefs.updateTrackedApps(newSet)
@@ -356,7 +328,11 @@ fun AppsSettingsScreen(navController: NavController) {
                     }
                 }
                 items(otherAppsList, key = { it.packageName }) { app ->
-                    AppItem(app, app.packageName in trackedApps) { isChecked ->
+                    AppItem(app, app.packageName in trackedApps, isLocked) { isChecked -> // Pass isLocked
+                        if (isLocked) {
+                            Toast.makeText(context, "Settings locked for 24h", Toast.LENGTH_SHORT).show()
+                            return@AppItem
+                        }
                         scope.launch {
                             val newSet = if (isChecked) trackedApps + app.packageName else trackedApps - app.packageName
                             prefs.updateTrackedApps(newSet)
@@ -369,7 +345,7 @@ fun AppsSettingsScreen(navController: NavController) {
 }
 
 @Composable
-fun AppItem(app: AppInfo, isTracked: Boolean, onToggle: (Boolean) -> Unit) {
+fun AppItem(app: AppInfo, isTracked: Boolean, isLocked: Boolean, onToggle: (Boolean) -> Unit) {
     ListItem(
         headlineContent = { Text(app.label) },
         leadingContent = {
@@ -382,7 +358,11 @@ fun AppItem(app: AppInfo, isTracked: Boolean, onToggle: (Boolean) -> Unit) {
         trailingContent = {
             Checkbox(
                 checked = isTracked,
-                onCheckedChange = onToggle
+                onCheckedChange = onToggle, // logic handled inside callback
+                enabled = !isLocked, // Visual disable
+                colors = CheckboxDefaults.colors(
+                    disabledCheckedColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                )
             )
         },
         modifier = Modifier.clickable { onToggle(!isTracked) }

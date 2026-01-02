@@ -49,6 +49,8 @@ class ScrollTrackingService : AccessibilityService() {
     private lateinit var repository: ScrollRepository
     private lateinit var prefs: UserPreferences
     private lateinit var windowManager: WindowManager
+    private var appLimitsCache: Map<String, Float> = emptyMap()
+    private var dailyAppUsageCache: Map<String, Float> = emptyMap()
 
     // Now stores EXCLUDED apps (Blacklist)
     @Volatile private var trackedAppsCache: Set<String> = emptySet()
@@ -104,15 +106,16 @@ class ScrollTrackingService : AccessibilityService() {
 
     private fun startStateObservation() {
         serviceScope.launch {
-            // Combine limits and excluded apps to keep cache updated
             combine(
                 prefs.trackedApps,
-                prefs.dailyLimit
-            ) { apps, limit ->
+                prefs.dailyLimit,
+                prefs.appLimits
+            ) { apps, globalLimit, appLimits ->
+                Triple(apps, globalLimit, appLimits)
+            }.collectLatest { (apps, globalLimit, limits) ->
                 trackedAppsCache = apps
-                updateLimits(limit)
-            }.collectLatest {
-                // Just keeping collection active
+                appLimitsCache = limits
+                updateLimits(globalLimit)
             }
         }
 
@@ -130,6 +133,15 @@ class ScrollTrackingService : AccessibilityService() {
                     .distinctUntilChanged()
                     .collectLatest { total ->
                         currentDailyTotal = total
+                        checkEnforcementState()
+                    }
+
+                repository.getDailyAppDistancesFlow(today)
+                    .distinctUntilChanged()
+                    .collectLatest { map ->
+                        dailyAppUsageCache = map
+                        // Calculate total from map to ensure consistency
+                        currentDailyTotal = map.values.sum()
                         checkEnforcementState()
                     }
             }
@@ -196,14 +208,44 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // 4. HARD BLOCK (User Defined Limit)
-        if (currentDailyTotal >= limitHardMeters) {
+        // Current active session logic
+        var effectiveAppUsage = (dailyAppUsageCache[currentAppPackage] ?: 0f)
+        var effectiveTotalUsage = currentDailyTotal
+
+        // Add the current session accumulator if it belongs to the current app
+        if (currentAppPackage.isNotEmpty()) {
+            effectiveAppUsage += sessionAccumulatedMeters
+            effectiveTotalUsage += sessionAccumulatedMeters
+        }
+
+        // 4. CHECK GLOBAL LIMIT (Existing Logic)
+        if (effectiveTotalUsage >= limitHardMeters) {
             if (!isOverlayShowing) {
                 showOverlay(
                     type = OverlayType.HARD,
                     title = "⛔ LIMIT REACHED",
-                    message = "You've exhausted your scroll budget (${limitHardMeters.toInt()}m).\nTake a breath.",
+                    message = "Global budget exhausted (${limitHardMeters.toInt()}m).",
                     btnText = "GO TO HOME SCREEN",
+                    bgColor = Color.parseColor("#F2000000"),
+                    titleColor = Color.RED
+                )
+            }
+            return
+        }
+
+        // 5. CHECK SPECIFIC APP LIMIT (New Logic)
+        val specificLimit = appLimitsCache[currentAppPackage]
+
+        // Log for debugging (Optional, can be removed in prod)
+        // Log.d("AntiDoom", "Checking $currentAppPackage: Usage=$effectiveAppUsage, Limit=$specificLimit")
+
+        if (specificLimit != null && effectiveAppUsage >= specificLimit) {
+            if (!isOverlayShowing) {
+                showOverlay(
+                    type = OverlayType.HARD,
+                    title = "⛔ APP LIMIT REACHED",
+                    message = "Limit for this app reached (${specificLimit.toInt()}m).",
+                    btnText = "CLOSE APP",
                     bgColor = Color.parseColor("#F2000000"),
                     titleColor = Color.RED
                 )
@@ -406,6 +448,11 @@ class ScrollTrackingService : AccessibilityService() {
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             if (pkgName !in trackedAppsCache) return
+
+            // CRITICAL FIX: Ensure current package is updated even if window change was missed
+            if (currentAppPackage != pkgName) {
+                currentAppPackage = pkgName
+            }
 
             if (isOverlayShowing) {
                 checkEnforcementState()
