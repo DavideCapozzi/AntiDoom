@@ -15,7 +15,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -30,6 +29,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.time.LocalDate
 import kotlin.math.abs
@@ -40,9 +40,7 @@ class ScrollTrackingService : AccessibilityService() {
     companion object {
         private const val PIXELS_PER_METER = 3500f
         private const val FALLBACK_SCROLL_PIXELS = 1500
-        private const val LIMIT_HARD_METERS = 100f   // 100% - Stop
-        private const val LIMIT_SOFT_METERS = 50f    // 50%  - Pause/Intervene
-        private const val LIMIT_WARNING_METERS = 25f // 25%  - Toast Warning
+        // removed hardcoded limits
         private const val EXIT_GRACE_PERIOD_MS = 2000L
     }
 
@@ -52,9 +50,14 @@ class ScrollTrackingService : AccessibilityService() {
     private lateinit var prefs: UserPreferences
     private lateinit var windowManager: WindowManager
 
-    // State Tracking
+    // Now stores EXCLUDED apps (Blacklist)
     @Volatile private var trackedAppsCache: Set<String> = emptySet()
     @Volatile private var currentDailyTotal: Float = 0f
+
+    // Dynamic Limits
+    @Volatile private var limitHardMeters: Float = 100f
+    private var limitSoftMeters: Float = 50f
+    private var limitWarningMeters: Float = 25f
 
     // Tracks the last external package
     @Volatile private var currentAppPackage: String = ""
@@ -93,12 +96,6 @@ class ScrollTrackingService : AccessibilityService() {
             startPeriodicFlushing()
             startStateObservation()
 
-            serviceScope.launch {
-                prefs.trackedApps.collectLatest { apps ->
-                    trackedAppsCache = apps
-                }
-            }
-
             startForegroundServiceSafe()
         } catch (e: Exception) {
             Log.e("AntiDoom", "Service initialization failed", e)
@@ -106,6 +103,19 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     private fun startStateObservation() {
+        serviceScope.launch {
+            // Combine limits and excluded apps to keep cache updated
+            combine(
+                prefs.trackedApps,
+                prefs.dailyLimit
+            ) { apps, limit ->
+                trackedAppsCache = apps
+                updateLimits(limit)
+            }.collectLatest {
+                // Just keeping collection active
+            }
+        }
+
         serviceScope.launch {
             while (isActive) {
                 val today = LocalDate.now().toString()
@@ -120,11 +130,18 @@ class ScrollTrackingService : AccessibilityService() {
                     .distinctUntilChanged()
                     .collectLatest { total ->
                         currentDailyTotal = total
-                        // Trigger a check whenever data changes
                         checkEnforcementState()
                     }
             }
         }
+    }
+
+    private fun updateLimits(limit: Float) {
+        limitHardMeters = limit
+        limitSoftMeters = limit * 0.5f
+        limitWarningMeters = limit * 0.25f
+        // Re-check enforcement immediately upon limit change
+        checkEnforcementState()
     }
 
     override fun onServiceConnected() {
@@ -162,43 +179,30 @@ class ScrollTrackingService : AccessibilityService() {
         return if (delta > 0) delta else 0
     }
 
-    /**
-     * CORE LOGIC: Validates state and decides enforcement.
-     * Includes "Sanity Check" to prevent Ghost Overlays.
-     */
     private fun checkEnforcementState() {
-        // 1. TIMING GUARD: If we recently exited, pause checks to allow animation/transition
         if (System.currentTimeMillis() - lastExitTimestamp < EXIT_GRACE_PERIOD_MS) {
             return
         }
 
-        // 2. SANITY CHECK (The Fix):
-        // Before relying on `currentAppPackage`, ask the system what is REALLY top-most.
-        // This handles cases where event stream lags behind reality (Zombie events).
         val actualForeground = activeWindowPackageName
-
-        // If we can determine the actual foreground, and it contradicts our cached state, update it.
         if (actualForeground != null && actualForeground != currentAppPackage) {
-            // Special case: If our overlay is the top window, ignore this check
-            // (otherwise we might detect ourselves and think we aren't in the app).
             if (actualForeground != packageName) {
                 currentAppPackage = actualForeground
             }
         }
 
-        // 3. TRACKING CHECK: If not in a tracked app, clean up and exit.
         if (currentAppPackage !in trackedAppsCache) {
             removeOverlaySafe()
             return
         }
 
-        // 4. HARD BLOCK (100% Limit)
-        if (currentDailyTotal >= LIMIT_HARD_METERS) {
+        // 4. HARD BLOCK (User Defined Limit)
+        if (currentDailyTotal >= limitHardMeters) {
             if (!isOverlayShowing) {
                 showOverlay(
                     type = OverlayType.HARD,
                     title = "⛔ LIMIT REACHED",
-                    message = "You've exhausted your scroll budget for today.\nTake a breath.",
+                    message = "You've exhausted your scroll budget (${limitHardMeters.toInt()}m).\nTake a breath.",
                     btnText = "GO TO HOME SCREEN",
                     bgColor = Color.parseColor("#F2000000"),
                     titleColor = Color.RED
@@ -208,7 +212,7 @@ class ScrollTrackingService : AccessibilityService() {
         }
 
         // 5. SOFT BLOCK (50% Limit)
-        if (currentDailyTotal >= LIMIT_SOFT_METERS && !hasSoftBlocked50) {
+        if (currentDailyTotal >= limitSoftMeters && !hasSoftBlocked50) {
             if (!isOverlayShowing) {
                 hasSoftBlocked50 = true
                 showOverlay(
@@ -223,39 +227,24 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // Cleanup if limits are no longer met
-        if (currentDailyTotal < LIMIT_SOFT_METERS && isOverlayShowing) {
+        if (currentDailyTotal < limitSoftMeters && isOverlayShowing) {
             removeOverlaySafe()
         }
 
         // 6. WARNING TOAST
-        if (currentDailyTotal >= LIMIT_WARNING_METERS &&
+        if (currentDailyTotal >= limitWarningMeters &&
             !hasWarned25 &&
-            currentDailyTotal < LIMIT_SOFT_METERS) {
+            currentDailyTotal < limitSoftMeters) {
             hasWarned25 = true
             showWarningToast()
         }
     }
 
-    /**
-     * Helper to get the definitive package name from the active window.
-     * This bypasses the event stream lag.
-     */
     private val activeWindowPackageName: String?
         get() {
             return try {
-                // Method 1: rootInActiveWindow (Most reliable for "what user is interacting with")
                 val root = rootInActiveWindow
-                if (root != null) {
-                    val pkg = root.packageName?.toString()
-                    // Don't recycle root here if we just access property,
-                    // but standard practice suggests being careful.
-                    // However, rootInActiveWindow does not need explicit recycle in recent APIs
-                    // unless we iterate children, but let's be safe if we were traversing.
-                    // For just packageName, it's fine.
-                    return pkg
-                }
-                null
+                root?.packageName?.toString()
             } catch (e: Exception) {
                 null
             }
@@ -300,8 +289,7 @@ class ScrollTrackingService : AccessibilityService() {
 
             val overlayView = FrameLayout(this@ScrollTrackingService).apply {
                 setBackgroundColor(bgColor)
-                // ... (UI Code remains identical to original for brevity) ...
-                // Re-inserting the exact UI setup code here:
+
                 val container = LinearLayout(context).apply {
                     orientation = LinearLayout.VERTICAL
                     gravity = Gravity.CENTER
@@ -352,12 +340,9 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     private fun handleOverlayAction(type: OverlayType) {
-        // Prevent re-triggering immediately
         lastExitTimestamp = System.currentTimeMillis()
-
         when (type) {
             OverlayType.HARD -> {
-                // Clear package to stop tracking immediately
                 currentAppPackage = ""
                 removeOverlaySafe()
                 performGlobalAction(GLOBAL_ACTION_HOME)
@@ -370,7 +355,6 @@ class ScrollTrackingService : AccessibilityService() {
 
     private fun removeOverlaySafe() {
         if (!isOverlayShowing) return
-
         serviceScope.launch(Dispatchers.Main) {
             try {
                 currentOverlayView?.let { view ->
@@ -409,30 +393,21 @@ class ScrollTrackingService : AccessibilityService() {
         if (event == null) return
         val pkgName = event.packageName?.toString() ?: return
 
-        // 1. SELF FILTER: Ignore events from our own overlay
         if (pkgName == packageName) return
 
-        // 2. STATE CHANGE HANDLING
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-
-            // If we are in the grace period, we trust the "Go Home" action
-            // and ignore temporary flickers from the closing app.
             if (System.currentTimeMillis() - lastExitTimestamp < EXIT_GRACE_PERIOD_MS) {
                 return
             }
-
-            // Update local state, but rely on checkEnforcementState to validate it
             currentAppPackage = pkgName
             checkEnforcementState()
             return
         }
 
-        // 3. SCROLL HANDLING
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             if (pkgName !in trackedAppsCache) return
 
             if (isOverlayShowing) {
-                // If overlay is up, ensure it should stay up
                 checkEnforcementState()
                 return
             }
@@ -443,7 +418,6 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     private fun startForegroundServiceSafe() {
-        // ... (Same as original) ...
         val channelId = "antidoom_service_channel"
         val manager = getSystemService(NotificationManager::class.java)
 

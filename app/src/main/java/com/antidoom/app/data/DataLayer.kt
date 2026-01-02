@@ -43,13 +43,42 @@ abstract class AppDatabase : RoomDatabase() {
 
 val Context.dataStore by preferencesDataStore("settings")
 
-class UserPreferences(context: Context) {
+class UserPreferences(private val context: Context) {
 
+    // Whitelist approach: Only apps in this set are tracked
     private val trackedAppsKey = stringSetPreferencesKey("tracked_apps")
+    private val dailyLimitKey = floatPreferencesKey("daily_limit_meters")
 
-    @Suppress("SpellCheckingInspection") // Fix: Ignora il typo su zhiliaoapp
+    // Default CORE apps enabled out-of-the-box
+    private val defaultCoreApps = setOf(
+        "com.instagram.android",
+        "com.zhiliaoapp.musically", // TikTok (Global)
+        "com.ss.android.ugc.trill", // TikTok (Alternative/Asia)
+        "com.google.android.youtube"
+    )
+
+    @Suppress("SpellCheckingInspection")
     val trackedApps: Flow<Set<String>> = context.dataStore.data.map {
-        it[trackedAppsKey] ?: setOf("com.instagram.android", "com.zhiliaoapp.musically", "com.google.android.youtube")
+        // If key doesn't exist, use defaultCoreApps.
+        // If user clears everything, it saves an empty set, so this default only applies on fresh install/reset.
+        it[trackedAppsKey] ?: defaultCoreApps
+    }
+
+    // Default limit is 100 meters
+    val dailyLimit: Flow<Float> = context.dataStore.data.map {
+        it[dailyLimitKey] ?: 100f
+    }
+
+    suspend fun updateDailyLimit(meters: Float) {
+        context.dataStore.edit { preferences ->
+            preferences[dailyLimitKey] = meters
+        }
+    }
+
+    suspend fun updateTrackedApps(apps: Set<String>) {
+        context.dataStore.edit { preferences ->
+            preferences[trackedAppsKey] = apps
+        }
     }
 }
 
