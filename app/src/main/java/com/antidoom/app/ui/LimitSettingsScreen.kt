@@ -1,7 +1,6 @@
 package com.antidoom.app.ui
 
 import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
@@ -36,7 +35,11 @@ fun LimitSettingsScreen(navController: NavController) {
     val scope = rememberCoroutineScope()
 
     val currentGlobalLimit by prefs.dailyLimit.collectAsState(initial = 100f)
-    val isLocked by prefs.isSettingsLocked.collectAsState(initial = false)
+
+    // TWO SEPARATE LOCK STATES
+    val isGeneralLocked by prefs.isGeneralLocked.collectAsState(initial = false)
+    val isAppLimitsLocked by prefs.isAppLimitsLocked.collectAsState(initial = false)
+
     val trackedAppsPackageNames by prefs.trackedApps.collectAsState(initial = emptySet())
     val appLimits by prefs.appLimits.collectAsState(initial = emptyMap())
 
@@ -46,10 +49,11 @@ fun LimitSettingsScreen(navController: NavController) {
     // State for Per-App Limit Dialog
     var showDialogForPackage by remember { mutableStateOf<String?>(null) }
 
-    // State for Confirmation Lock Dialog
-    var showLockConfirmDialog by remember { mutableStateOf(false) }
+    // State for Lock Confirmation Dialogs
+    var showGeneralLockConfirm by remember { mutableStateOf(false) }
+    var showAppLockConfirm by remember { mutableStateOf(false) }
 
-    // Effetto per caricare le info delle app (Icone/Label) e filtrare quelle non installate
+    // Effetto per caricare le info delle app
     LaunchedEffect(trackedAppsPackageNames) {
         withContext(Dispatchers.IO) {
             val pm = context.packageManager
@@ -62,8 +66,6 @@ fun LimitSettingsScreen(navController: NavController) {
                         icon = pm.getApplicationIcon(appInfo)
                     )
                 } catch (e: PackageManager.NameNotFoundException) {
-                    // L'app è nel database ma non nel telefono (es. trill/tiktok asia)
-                    // La ignoriamo visivamente
                     null
                 }
             }.sortedBy { it.label }
@@ -79,17 +81,6 @@ fun LimitSettingsScreen(navController: NavController) {
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
-                },
-                actions = {
-                    IconButton(
-                        onClick = { if (!isLocked) showLockConfirmDialog = true else Toast.makeText(context, "Settings are locked for 24h", Toast.LENGTH_SHORT).show() }
-                    ) {
-                        Icon(
-                            if (isLocked) Icons.Default.Lock else Icons.Default.LockOpen,
-                            contentDescription = "Lock Settings",
-                            tint = if (isLocked) Color.Red else MaterialTheme.colorScheme.primary
-                        )
-                    }
                 }
             )
         }
@@ -98,34 +89,48 @@ fun LimitSettingsScreen(navController: NavController) {
 
             // 1. GLOBAL LIMIT SECTION
             item {
-                Text("Global Limit", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                ) {
+                    Text("Global Limit", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.weight(1f))
+                    // GENERAL LOCK ICON
+                    IconButton(
+                        onClick = {
+                            if (!isGeneralLocked) showGeneralLockConfirm = true
+                            else Toast.makeText(context, "Global settings locked for 24h", Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Icon(
+                            if (isGeneralLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                            contentDescription = "General Lock",
+                            tint = if (isGeneralLocked) Color.Red else Color.Gray
+                        )
+                    }
+                }
 
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "${currentGlobalLimit.toInt()} m",
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.weight(1f))
-                            if (isLocked) Icon(Icons.Default.Lock, null, modifier = Modifier.size(16.dp), tint = Color.Gray)
-                        }
+                        Text(
+                            text = "${currentGlobalLimit.toInt()} m",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold
+                        )
 
                         Slider(
                             value = currentGlobalLimit,
                             onValueChange = {
-                                if (!isLocked) scope.launch { prefs.updateDailyLimit(it) }
+                                if (!isGeneralLocked) scope.launch { prefs.updateDailyLimit(it) }
                                 else Toast.makeText(context, "Locked!", Toast.LENGTH_SHORT).show()
                             },
                             valueRange = 10f..500f,
                             steps = 48,
-                            enabled = !isLocked,
-                            modifier = Modifier.alpha(if (isLocked) 0.5f else 1f)
+                            enabled = !isGeneralLocked,
+                            modifier = Modifier.alpha(if (isGeneralLocked) 0.5f else 1f)
                         )
                         Text("Applies to sum of all tracked apps.", style = MaterialTheme.typography.bodySmall)
                     }
@@ -135,7 +140,26 @@ fun LimitSettingsScreen(navController: NavController) {
 
             // 2. PER-APP LIMITS SECTION
             item {
-                Text("Per-App Limits", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                ) {
+                    Text("Per-App Limits", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.weight(1f))
+                    // APP LOCK ICON
+                    IconButton(
+                        onClick = {
+                            if (!isAppLimitsLocked) showAppLockConfirm = true
+                            else Toast.makeText(context, "App limits locked for 24h", Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Icon(
+                            if (isAppLimitsLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                            contentDescription = "App Limits Lock",
+                            tint = if (isAppLimitsLocked) Color.Red else Color.Gray
+                        )
+                    }
+                }
                 Text("Set specific limits for your worst habits.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                 Spacer(modifier = Modifier.height(8.dp))
             }
@@ -151,7 +175,7 @@ fun LimitSettingsScreen(navController: NavController) {
                     AppLimitItem(
                         appInfo = app,
                         currentLimit = limit,
-                        isLocked = isLocked,
+                        isLocked = isAppLimitsLocked, // Using separate lock
                         onClick = { showDialogForPackage = app.packageName }
                     )
                 }
@@ -161,30 +185,49 @@ fun LimitSettingsScreen(navController: NavController) {
 
     // --- DIALOGS ---
 
-    // 1. Lock Confirmation Dialog
-    if (showLockConfirmDialog) {
+    // 1. General Lock Confirmation
+    if (showGeneralLockConfirm) {
         AlertDialog(
-            onDismissRequest = { showLockConfirmDialog = false },
-            title = { Text("Lock Settings?") },
-            text = { Text("You will NOT be able to change limits or tracked apps for the next 24 hours.\n\nThis is designed to prevent you from cheating on your goals.") },
+            onDismissRequest = { showGeneralLockConfirm = false },
+            title = { Text("Lock Global Settings?") },
+            text = { Text("Global Limit and App Selection will be locked for 24 hours.\n\nYou won't be able to remove tracked apps or increase the global budget.") },
             confirmButton = {
                 Button(
                     onClick = {
-                        scope.launch { prefs.setLock(24 * 60 * 60 * 1000L) }
-                        showLockConfirmDialog = false
+                        scope.launch { prefs.setGeneralLock(24 * 60 * 60 * 1000L) }
+                        showGeneralLockConfirm = false
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                 ) {
-                    Text("Lock for 24h")
+                    Text("Lock General")
                 }
             },
-            dismissButton = {
-                TextButton(onClick = { showLockConfirmDialog = false }) { Text("Cancel") }
-            }
+            dismissButton = { TextButton(onClick = { showGeneralLockConfirm = false }) { Text("Cancel") } }
         )
     }
 
-    // 2. Set App Limit Dialog
+    // 2. App Limits Lock Confirmation
+    if (showAppLockConfirm) {
+        AlertDialog(
+            onDismissRequest = { showAppLockConfirm = false },
+            title = { Text("Lock App Limits?") },
+            text = { Text("Specific App Limits will be locked for 24 hours.\n\nYou won't be able to change limits for individual apps.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        scope.launch { prefs.setAppLimitsLock(24 * 60 * 60 * 1000L) }
+                        showAppLockConfirm = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Lock App Limits")
+                }
+            },
+            dismissButton = { TextButton(onClick = { showAppLockConfirm = false }) { Text("Cancel") } }
+        )
+    }
+
+    // 3. Set App Limit Dialog
     if (showDialogForPackage != null) {
         val pkg = showDialogForPackage!!
         val appName = activeAppsList.find { it.packageName == pkg }?.label ?: "App"
@@ -192,9 +235,9 @@ fun LimitSettingsScreen(navController: NavController) {
         var sliderValue by remember { mutableFloatStateOf(current) }
         var isEnabled by remember { mutableStateOf(appLimits.containsKey(pkg)) }
 
-        if (isLocked) {
+        if (isAppLimitsLocked) {
             showDialogForPackage = null
-            Toast.makeText(context, "Settings are locked.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "App limits are locked.", Toast.LENGTH_SHORT).show()
         } else {
             AlertDialog(
                 onDismissRequest = { showDialogForPackage = null },

@@ -24,6 +24,7 @@ data class AppDistanceTuple(
     @ColumnInfo(name = "packageName") val packageName: String,
     @ColumnInfo(name = "total") val total: Float
 )
+
 @Dao
 interface ScrollDao {
     @Insert
@@ -52,13 +53,16 @@ val Context.dataStore by preferencesDataStore("settings")
 
 class UserPreferences(private val context: Context) {
 
-    // Whitelist approach: Only apps in this set are tracked
+    // Keys
     private val trackedAppsKey = stringSetPreferencesKey("tracked_apps")
     private val dailyLimitKey = floatPreferencesKey("daily_limit_meters")
-    private val lockedUntilKey = longPreferencesKey("locked_until_ts")
     private val appLimitsKey = stringPreferencesKey("app_limits_json")
 
-    // Default CORE apps enabled out-of-the-box
+    // --- DUAL LOCK KEYS ---
+    private val generalLockedUntilKey = longPreferencesKey("general_locked_until_ts")
+    private val appLockedUntilKey = longPreferencesKey("app_limits_locked_until_ts")
+
+    // Default CORE apps
     private val defaultCoreApps = setOf(
         "com.instagram.android",
         "com.zhiliaoapp.musically", // TikTok (Global)
@@ -68,12 +72,9 @@ class UserPreferences(private val context: Context) {
 
     @Suppress("SpellCheckingInspection")
     val trackedApps: Flow<Set<String>> = context.dataStore.data.map {
-        // If key doesn't exist, use defaultCoreApps.
-        // If user clears everything, it saves an empty set, so this default only applies on fresh install/reset.
         it[trackedAppsKey] ?: defaultCoreApps
     }
 
-    // Default limit is 100 meters
     val dailyLimit: Flow<Float> = context.dataStore.data.map {
         it[dailyLimitKey] ?: 100f
     }
@@ -90,20 +91,33 @@ class UserPreferences(private val context: Context) {
         }
     }
 
-    val isSettingsLocked: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        val until = prefs[lockedUntilKey] ?: 0L
+    // --- LOCK 1: GENERAL (Global Limit + Tracked Apps List) ---
+    val isGeneralLocked: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        val until = prefs[generalLockedUntilKey] ?: 0L
         System.currentTimeMillis() < until
+    }
+
+    suspend fun setGeneralLock(durationMs: Long) {
+        context.dataStore.edit { prefs ->
+            prefs[generalLockedUntilKey] = System.currentTimeMillis() + durationMs
+        }
+    }
+
+    // --- LOCK 2: PER-APP LIMITS ---
+    val isAppLimitsLocked: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        val until = prefs[appLockedUntilKey] ?: 0L
+        System.currentTimeMillis() < until
+    }
+
+    suspend fun setAppLimitsLock(durationMs: Long) {
+        context.dataStore.edit { prefs ->
+            prefs[appLockedUntilKey] = System.currentTimeMillis() + durationMs
+        }
     }
 
     val appLimits: Flow<Map<String, Float>> = context.dataStore.data.map { prefs ->
         val json = prefs[appLimitsKey] ?: "{}"
         parseAppLimits(json)
-    }
-
-    suspend fun setLock(durationMs: Long) {
-        context.dataStore.edit { prefs ->
-            prefs[lockedUntilKey] = System.currentTimeMillis() + durationMs
-        }
     }
 
     suspend fun updateAppLimit(packageName: String, limit: Float?) {
@@ -119,12 +133,11 @@ class UserPreferences(private val context: Context) {
         }
     }
 
-    // Simple manual JSON parser/formatter to avoid adding Gson/Moshi dependency for this simple task
+    // Helpers JSON
     private fun parseAppLimits(json: String): Map<String, Float> {
         if (json == "{}" || json.isEmpty()) return emptyMap()
         val map = mutableMapOf<String, Float>()
         try {
-            // format: "pkg1:100.0,pkg2:50.0"
             json.split(",").forEach { entry ->
                 val parts = entry.split(":")
                 if (parts.size == 2) {
@@ -177,13 +190,7 @@ class ScrollRepository private constructor(context: Context) {
     fun getDailyAppDistancesFlow(date: String): Flow<Map<String, Float>> {
         return db.scrollDao().getDailyBreakdown(date)
             .combine(_activeSessionDistance) { dbList, sessionDist ->
-                // Convert DB list to map
                 val map = dbList.associate { it.packageName to it.total }.toMutableMap()
-
-                // Add current active session to the specific app entry (this logic requires knowing CURRENT app in repo,
-                // but for simplicity, we usually flush often. However, to be precise, we can't easily attribute
-                // _activeSessionDistance to a specific package here without passing the package name.
-                // For the Service logic, we will handle the active session addition manually there.)
                 map
             }
     }

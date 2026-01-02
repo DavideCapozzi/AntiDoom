@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,7 +50,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import coil.compose.rememberAsyncImagePainter
-import android.widget.Toast
 
 // Navigation Routes
 sealed class Screen(val route: String, val label: String? = null, val icon: ImageVector? = null) {
@@ -228,7 +228,13 @@ fun AppsSettingsScreen(navController: NavController) {
     val context = LocalContext.current
     val prefs = remember { UserPreferences(context) }
     val scope = rememberCoroutineScope()
-    val isLocked by prefs.isSettingsLocked.collectAsState(initial = false)
+
+    // --- UPDATED LOCK LOGIC ---
+    val isGeneralLocked by prefs.isGeneralLocked.collectAsState(initial = false)
+    val isAppLimitsLocked by prefs.isAppLimitsLocked.collectAsState(initial = false)
+
+    // Lock controls if EITHER General Lock OR App Limits Lock is active
+    val isLocked = isGeneralLocked || isAppLimitsLocked
 
     // Whitelist: Apps in this list ARE tracked
     val trackedApps by prefs.trackedApps.collectAsState(initial = emptySet())
@@ -276,6 +282,14 @@ fun AppsSettingsScreen(navController: NavController) {
                     IconButton(onClick = { navController.popBackStack() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
+                },
+                actions = {
+                    // Show lock icon if any lock is active
+                    if (isLocked) {
+                        IconButton(onClick = { Toast.makeText(context, "Selection locked by active timer", Toast.LENGTH_SHORT).show() }) {
+                            Icon(Icons.Default.Lock, "Locked", tint = Color.Red)
+                        }
+                    }
                 }
             )
         }
@@ -303,9 +317,9 @@ fun AppsSettingsScreen(navController: NavController) {
                         }
                     }
                     items(coreAppsList, key = { it.packageName }) { app ->
-                        AppItem(app, app.packageName in trackedApps, isLocked) { isChecked -> // Pass isLocked
+                        AppItem(app, app.packageName in trackedApps, isLocked) { isChecked ->
                             if (isLocked) {
-                                Toast.makeText(context, "Settings locked for 24h", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Locked: Cannot change apps while timer is active", Toast.LENGTH_SHORT).show()
                                 return@AppItem
                             }
                             scope.launch {
@@ -328,9 +342,9 @@ fun AppsSettingsScreen(navController: NavController) {
                     }
                 }
                 items(otherAppsList, key = { it.packageName }) { app ->
-                    AppItem(app, app.packageName in trackedApps, isLocked) { isChecked -> // Pass isLocked
+                    AppItem(app, app.packageName in trackedApps, isLocked) { isChecked ->
                         if (isLocked) {
-                            Toast.makeText(context, "Settings locked for 24h", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Locked: Cannot change apps while timer is active", Toast.LENGTH_SHORT).show()
                             return@AppItem
                         }
                         scope.launch {

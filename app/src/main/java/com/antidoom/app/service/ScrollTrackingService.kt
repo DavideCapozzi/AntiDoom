@@ -51,13 +51,13 @@ class ScrollTrackingService : AccessibilityService() {
 
     // Caches for Limits
     private var appLimitsCache: Map<String, Float> = emptyMap()
-    private var dailyAppUsageCache: Map<String, Float> = emptyMap() // From DB
+    private var dailyAppUsageCache: Map<String, Float> = emptyMap()
 
     // Config Cache
     @Volatile private var trackedAppsCache: Set<String> = emptySet()
 
     // Global Counters
-    @Volatile private var currentDailyTotal: Float = 0f // From DB + RAM handled in check
+    @Volatile private var currentDailyTotal: Float = 0f
 
     // Dynamic Limits
     @Volatile private var limitHardMeters: Float = 100f
@@ -131,7 +131,6 @@ class ScrollTrackingService : AccessibilityService() {
                     .collectLatest { map ->
                         dailyAppUsageCache = map
                         currentDailyTotal = map.values.sum()
-                        // Re-check enforcement whenever DB updates
                         checkEnforcementState()
                     }
             }
@@ -161,9 +160,9 @@ class ScrollTrackingService : AccessibilityService() {
                     processScrollEvent(event, pkgName)
                 } catch (e: Exception) {
                     Log.e("AntiDoom", "Error processing scroll event", e)
-                } finally {
-                    try { event.recycle() } catch (_: Exception) {}
                 }
+                // Removed event.recycle() as per deprecation warning.
+                // Framework handles object pooling or GC handles cleanup.
             }
         }
     }
@@ -181,7 +180,6 @@ class ScrollTrackingService : AccessibilityService() {
         sessionAccumulatedMeters += meters
         repository.updateActiveDistance(sessionAccumulatedMeters) // Update RAM view
 
-        // Check limits after adding meters
         checkEnforcementState()
     }
 
@@ -190,10 +188,6 @@ class ScrollTrackingService : AccessibilityService() {
         return if (delta > 0) delta else 0
     }
 
-    /**
-     * CRITICAL FIX: Safe Package Switching
-     * Flushes the previous app's session BEFORE switching currentAppPackage variable.
-     */
     private suspend fun handlePackageSwitch(newPackage: String) {
         if (currentAppPackage.isNotEmpty() && sessionAccumulatedMeters > 0) {
             // Save meters to the OLD package
@@ -209,17 +203,14 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // Safety check: if current app is not tracked, ensure overlay is gone and return
         if (currentAppPackage !in trackedAppsCache) {
             removeOverlaySafe()
             return
         }
 
-        // Calculate usage considering DB + Current RAM Session
         var effectiveAppUsage = (dailyAppUsageCache[currentAppPackage] ?: 0f)
         var effectiveTotalUsage = currentDailyTotal
 
-        // Add current session only if it matches (it should, thanks to handlePackageSwitch)
         if (currentAppPackage.isNotEmpty()) {
             effectiveAppUsage += sessionAccumulatedMeters
             effectiveTotalUsage += sessionAccumulatedMeters
@@ -256,7 +247,7 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // 3. SOFT BLOCK (50% of Global)
+        // 3. SOFT BLOCK
         if (effectiveTotalUsage >= limitSoftMeters && !hasSoftBlocked50) {
             if (!isOverlayShowing) {
                 hasSoftBlocked50 = true
@@ -272,14 +263,13 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // Remove overlay if limits are satisfied
         if (effectiveTotalUsage < limitHardMeters &&
             (specificLimit == null || effectiveAppUsage < specificLimit) &&
             effectiveTotalUsage < limitSoftMeters && isOverlayShowing) {
             removeOverlaySafe()
         }
 
-        // 4. WARNING TOAST (25% of Global)
+        // 4. WARNING TOAST
         if (effectiveTotalUsage >= limitWarningMeters &&
             !hasWarned25 &&
             effectiveTotalUsage < limitSoftMeters) {
@@ -327,7 +317,7 @@ class ScrollTrackingService : AccessibilityService() {
 
             val overlayView = FrameLayout(this@ScrollTrackingService).apply {
                 setBackgroundColor(bgColor)
-                isClickable = true // Capture clicks
+                isClickable = true
 
                 val container = LinearLayout(context).apply {
                     orientation = LinearLayout.VERTICAL
@@ -382,8 +372,6 @@ class ScrollTrackingService : AccessibilityService() {
         lastExitTimestamp = System.currentTimeMillis()
         when (type) {
             OverlayType.HARD -> {
-                // For hard block, reset current package to avoid immediate re-trigger
-                // But perform global home action
                 removeOverlaySafe()
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
@@ -424,17 +412,14 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
-    @Suppress("DEPRECATION")
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val pkgName = event.packageName?.toString() ?: return
 
-        if (pkgName == packageName) return // Ignore self
+        if (pkgName == packageName) return
 
-        // 1. WINDOW STATE CHANGED (App Switch)
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             if (pkgName != currentAppPackage) {
-                // Must launch in serviceScope to allow suspend function (DB write)
                 serviceScope.launch {
                     handlePackageSwitch(pkgName)
                     checkEnforcementState()
@@ -443,11 +428,9 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // 2. VIEW SCROLLED (Tracking)
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             if (pkgName !in trackedAppsCache) return
 
-            // If we missed a window change, handle switch now
             if (pkgName != currentAppPackage) {
                 serviceScope.launch { handlePackageSwitch(pkgName) }
             }
@@ -457,7 +440,6 @@ class ScrollTrackingService : AccessibilityService() {
                 return
             }
 
-            // Send to processing channel
             val eventCopy = AccessibilityEvent.obtain(event)
             scrollEventChannel.trySend(eventCopy to pkgName)
         }
