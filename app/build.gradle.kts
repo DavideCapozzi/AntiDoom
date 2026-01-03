@@ -12,8 +12,8 @@ android {
         applicationId = "com.antidoom.app"
         minSdk = 28 // Android 9 (Pie)
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.6"
+        versionCode = 4
+        versionName = "0.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
