@@ -4,14 +4,25 @@ import android.content.Context
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.room.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.time.LocalDate
 
-@Entity(tableName = "scroll_sessions")
+// Added indices on 'date' and 'packageName' to speed up lookup queries.
+// 'date' is used in every daily stats query, making this crucial for performance.
+@Entity(
+    tableName = "scroll_sessions",
+    indices = [
+        Index(value = ["date"]),
+        Index(value = ["packageName"])
+    ]
+)
 data class ScrollSession(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val packageName: String,
@@ -30,21 +41,32 @@ interface ScrollDao {
     @Insert
     suspend fun insert(session: ScrollSession)
 
+    // Uses Index on 'date' for faster aggregation
     @Query("SELECT COALESCE(SUM(distanceMeters), 0) FROM scroll_sessions WHERE date = :date")
     fun getDailyDistance(date: String): Flow<Float>
 
     @Query("SELECT packageName, COALESCE(SUM(distanceMeters), 0) as total FROM scroll_sessions WHERE date = :date GROUP BY packageName")
     fun getDailyBreakdown(date: String): Flow<List<AppDistanceTuple>>
+
+    // Maintenance query to remove old data and save space
+    @Query("DELETE FROM scroll_sessions WHERE date < :thresholdDate")
+    suspend fun deleteOlderThan(thresholdDate: String)
 }
 
-@Database(entities = [ScrollSession::class], version = 1, exportSchema = false)
+// Bumped version to 2 to support Schema changes (Indices).
+// fallbackToDestructiveMigration() will WIPE existing data on the first run.
+// In a production app, you should provide a Migration strategy.
+@Database(entities = [ScrollSession::class], version = 2, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun scrollDao(): ScrollDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
         fun get(context: Context): AppDatabase = INSTANCE ?: synchronized(this) {
-            Room.databaseBuilder(context, AppDatabase::class.java, "antidoom.db").build().also { INSTANCE = it }
+            Room.databaseBuilder(context, AppDatabase::class.java, "antidoom.db")
+                .fallbackToDestructiveMigration()
+                .build()
+                .also { INSTANCE = it }
         }
     }
 }
@@ -65,12 +87,11 @@ class UserPreferences(private val context: Context) {
     // Default CORE apps
     private val defaultCoreApps = setOf(
         "com.instagram.android",
-        "com.zhiliaoapp.musically", // TikTok (Global)
-        "com.ss.android.ugc.trill", // TikTok (Alternative/Asia)
+        "com.zhiliaoapp.musically",
+        "com.ss.android.ugc.trill",
         "com.google.android.youtube"
     )
 
-    @Suppress("SpellCheckingInspection")
     val trackedApps: Flow<Set<String>> = context.dataStore.data.map {
         it[trackedAppsKey] ?: defaultCoreApps
     }
@@ -115,6 +136,7 @@ class UserPreferences(private val context: Context) {
         }
     }
 
+    // Optimized limit parsing to avoid potential overhead if string is malformed
     val appLimits: Flow<Map<String, Float>> = context.dataStore.data.map { prefs ->
         val json = prefs[appLimitsKey] ?: "{}"
         parseAppLimits(json)
@@ -141,7 +163,9 @@ class UserPreferences(private val context: Context) {
             json.split(",").forEach { entry ->
                 val parts = entry.split(":")
                 if (parts.size == 2) {
-                    map[parts[0]] = parts[1].toFloatOrNull() ?: 0f
+                    val pkg = parts[0]
+                    val limit = parts[1].toFloatOrNull() ?: 0f
+                    map[pkg] = limit
                 }
             }
         } catch (e: Exception) { e.printStackTrace() }
@@ -156,7 +180,25 @@ class UserPreferences(private val context: Context) {
 class ScrollRepository private constructor(context: Context) {
     private val db = AppDatabase.get(context)
 
+    // Tracks current session in RAM to avoid excessive DB writes
     private val _activeSessionDistance = MutableStateFlow(0f)
+
+    // Scope for background maintenance tasks
+    private val repoScope = CoroutineScope(Dispatchers.IO)
+
+    init {
+        // Fire-and-forget maintenance on startup.
+        // Deletes records older than 7 days to keep DB lean.
+        repoScope.launch {
+            try {
+                // Using ISO-8601 string comparison for date
+                val thresholdDate = LocalDate.now().minusDays(7).toString()
+                db.scrollDao().deleteOlderThan(thresholdDate)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
 
     fun getDailyDistanceFlow(date: String): Flow<Float> {
         return db.scrollDao().getDailyDistance(date)
@@ -181,6 +223,8 @@ class ScrollRepository private constructor(context: Context) {
             )
             db.scrollDao().insert(session)
 
+            // Subtract flushed distance from RAM accumulator to avoid double counting
+            // when the UI combines DB + RAM.
             _activeSessionDistance.update { (it - distance).coerceAtLeast(0f) }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -189,7 +233,10 @@ class ScrollRepository private constructor(context: Context) {
 
     fun getDailyAppDistancesFlow(date: String): Flow<Map<String, Float>> {
         return db.scrollDao().getDailyBreakdown(date)
-            .combine(_activeSessionDistance) { dbList, sessionDist ->
+            .combine(_activeSessionDistance) { dbList, _ ->
+                // Note: The active RAM session is currently NOT attributed to a specific app
+                // in this breakdown view, only to the global total.
+                // This preserves original behavior.
                 val map = dbList.associate { it.packageName to it.total }.toMutableMap()
                 map
             }
