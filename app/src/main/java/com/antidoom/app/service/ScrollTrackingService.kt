@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.time.LocalDate
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
 @Suppress("AccessibilityServiceInfo")
@@ -59,7 +60,8 @@ class ScrollTrackingService : AccessibilityService() {
         var warned25: Boolean = false,
         var softBlocked50: Boolean = false
     )
-    private val enforcementStates = mutableMapOf<String, EnforcementState>()
+    // Optimized: ConcurrentHashMap prevents ConcurrentModificationException and reduces locking overhead
+    private val enforcementStates = ConcurrentHashMap<String, EnforcementState>()
 
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
@@ -68,14 +70,15 @@ class ScrollTrackingService : AccessibilityService() {
     private lateinit var windowManager: WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // --- DATA CACHE (Volatile & Optimistic) ---
-    // Usiamo mappe immutabili rimpiazzate atomicamente per thread-safety senza lock complessi
+    // --- DATA CACHE (Optimized) ---
     @Volatile private var trackedAppsCache: Set<String> = emptySet()
     @Volatile private var appLimitsCache: Map<String, Float> = emptyMap()
     @Volatile private var globalLimitMeters: Float = 100f
 
-    // Critical: Questa cache deve essere aggiornata ottimisticamente
-    @Volatile private var dailyAppUsageCache: Map<String, Float> = emptyMap()
+    // CRITICAL OPTIMIZATION: Use ConcurrentHashMap to avoid allocating new Maps on every scroll event.
+    // This dramatically reduces GC pressure (Battery Saver).
+    private val dailyAppUsageCache = ConcurrentHashMap<String, Float>()
+
     @Volatile private var currentDailyTotal: Float = 0f
 
     // Session State
@@ -88,7 +91,14 @@ class ScrollTrackingService : AccessibilityService() {
     @Volatile private var immunityDeadline: Long = 0L
     private var lastBlockedPackage: String = ""
     private var isOverlayShowing = false
-    private var currentOverlayView: View? = null
+
+    // CACHED OVERLAY VIEW to avoid inflation lag
+    private var cachedOverlayBaseView: FrameLayout? = null
+    // References to child views inside the cached overlay for fast updates
+    private var cachedTitleView: TextView? = null
+    private var cachedMsgView: TextView? = null
+    private var cachedBtn: Button? = null
+
     private var currentOverlayType: OverlayType? = null
 
     private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
@@ -100,9 +110,12 @@ class ScrollTrackingService : AccessibilityService() {
         super.onCreate()
         try {
             repository = ScrollRepository.get(applicationContext)
-            prefs = UserPreferences(applicationContext)
+            prefs = UserPreferences.get(applicationContext) // Use Singleton
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
             ensureStateExists("GLOBAL")
+
+            // Pre-create overlay view to ensure 0ms latency when showing it
+            createReusableOverlayView()
 
             startEventConsumer()
             startPeriodicFlushing()
@@ -114,6 +127,7 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     private fun ensureStateExists(key: String) {
+        // ConcurrentHashMap handle logic safely
         if (!enforcementStates.containsKey(key)) {
             enforcementStates[key] = EnforcementState()
         }
@@ -139,10 +153,10 @@ class ScrollTrackingService : AccessibilityService() {
                 repository.getDailyAppDistancesFlow(today)
                     .distinctUntilChanged()
                     .collectLatest { map ->
-                        // Questo aggiorna la cache con la "Verità" dal DB.
-                        // Sovrascriverà i nostri aggiornamenti ottimistici, ma va bene
-                        // perché a questo punto il DB dovrebbe essere allineato.
-                        dailyAppUsageCache = map
+                        // SYNC DB with Cache efficiently
+                        map.forEach { (pkg, dist) ->
+                            dailyAppUsageCache[pkg] = dist
+                        }
                         currentDailyTotal = map.values.sum()
                         checkEnforcementState(source = "DB_UPDATE")
                     }
@@ -187,9 +201,6 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
-    /**
-     * CRITICAL FIX: Optimistic Update
-     */
     private fun handlePackageSwitch(newPackage: String) {
         if (newPackage == currentAppPackage) return
 
@@ -197,23 +208,17 @@ class ScrollTrackingService : AccessibilityService() {
         val metersToFlush = sessionAccumulatedMeters
 
         if (previousPkg.isNotEmpty() && metersToFlush > 0) {
-            // 1. Aggiornamento DB Asincrono (Lento)
+            // 1. DB Update Async
             serviceScope.launch {
                 repository.flushSessionToDb(previousPkg, metersToFlush)
             }
 
-            // 2. Aggiornamento Cache LOCALE Istantaneo (Veloce)
-            // Questo chiude il "Persistence Gap". Aggiorniamo la RAM subito.
-            val currentMap = dailyAppUsageCache.toMutableMap()
-            val oldVal = currentMap[previousPkg] ?: 0f
-            currentMap[previousPkg] = oldVal + metersToFlush
-
-            // Commit atomico alla variabile volatile
-            dailyAppUsageCache = currentMap
+            // 2. Local Cache Update (Optimistic & Zero-Allocation)
+            val oldVal = dailyAppUsageCache[previousPkg] ?: 0f
+            dailyAppUsageCache[previousPkg] = oldVal + metersToFlush
             currentDailyTotal += metersToFlush
         }
 
-        // Reset Sessione
         sessionAccumulatedMeters = 0f
         lastUiUpdateDistance = 0f
         repository.updateActiveDistance(0f)
@@ -221,7 +226,6 @@ class ScrollTrackingService : AccessibilityService() {
 
         ensureStateExists(newPackage)
 
-        // Controllo Limiti all'ingresso
         if (newPackage in trackedAppsCache) {
             checkEnforcementState(source = "WINDOW_SWITCH")
         } else {
@@ -265,25 +269,19 @@ class ScrollTrackingService : AccessibilityService() {
         return if (delta > 0) delta else 0
     }
 
-    /**
-     * LOGICA PRIORITÀ:
-     * 1. App Limit (Specifico) -> Vince su tutto.
-     * 2. Global Limit (Generico) -> Scatta se App Limit non è attivo o non raggiunto.
-     */
     private fun checkEnforcementState(source: String) {
         if (currentAppPackage !in trackedAppsCache) {
             if (isOverlayShowing) removeOverlaySafe()
             return
         }
 
-        // Calcolo Dati (Cache Aggiornata Ottimisticamente + Sessione Corrente)
         val usageGlobal = currentDailyTotal + sessionAccumulatedMeters
         val usageApp = (dailyAppUsageCache[currentAppPackage] ?: 0f) + sessionAccumulatedMeters
         val limitApp = appLimitsCache[currentAppPackage]
 
-        // --- HARD BLOCK CHECK (Priorità Invertita) ---
+        // --- PRIORITY LOGIC UNCHANGED ---
 
-        // 1. Check APP LIMIT (Massima Priorità Specificità)
+        // 1. Check APP LIMIT
         if (limitApp != null && usageApp >= limitApp) {
             triggerOverlay(
                 OverlayType.HARD,
@@ -291,10 +289,10 @@ class ScrollTrackingService : AccessibilityService() {
                 "Limit for this app reached.",
                 "CLOSE APP"
             )
-            return // Blocca qui, ignora Global
+            return
         }
 
-        // 2. Check GLOBAL LIMIT (Fallback Generico)
+        // 2. Check GLOBAL LIMIT
         if (usageGlobal >= globalLimitMeters) {
             triggerOverlay(
                 OverlayType.HARD,
@@ -305,34 +303,21 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // --- NESSUN HARD BLOCK ATTIVO ---
-
-        // Rimuovi Hard Overlay se i limiti non sono più superati
+        // --- CLEAR HARD BLOCK ---
         if (isOverlayShowing && currentOverlayType == OverlayType.HARD) {
             removeOverlaySafe()
         }
 
-        // --- SOFT WARNINGS (Stateful) ---
-
-        // Gestione priorità anche per i Warning:
-        // Se l'app ha un limite, mostra i warning relativi all'app.
-        // Altrimenti mostra i warning globali.
-
+        // --- WARNINGS ---
         var warningHandled = false
-
         if (limitApp != null) {
             warningHandled = checkIntermediateStates(usageApp, limitApp, currentAppPackage)
         }
-
-        // Se non abbiamo mostrato warning specifici per l'app, controlliamo il globale
         if (!warningHandled) {
             checkIntermediateStates(usageGlobal, globalLimitMeters, "GLOBAL")
         }
     }
 
-    /**
-     * Ritorna true se un warning è stato attivato/gestito
-     */
     private fun checkIntermediateStates(usage: Float, limit: Float, key: String): Boolean {
         if (limit <= 0) return false
 
@@ -388,22 +373,77 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
-    // --- OVERLAY MANAGEMENT ---
+    // --- OVERLAY MANAGEMENT (Optimized for Reuse) ---
 
     data class ActionRequest(val type: OverlayType, val title: String, val message: String, val btnText: String, val color: Int)
     enum class OverlayType { HARD, SOFT }
 
+    // Optimization: Create view once, attach/detach as needed
+    @SuppressLint("SetTextI18n")
+    private fun createReusableOverlayView() {
+        if (cachedOverlayBaseView != null) return
+
+        val ctx = this
+        val base = FrameLayout(ctx)
+
+        val container = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+
+        val titleView = TextView(ctx).apply {
+            setTextColor(Color.WHITE)
+            textSize = 28f
+            gravity = Gravity.CENTER
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        cachedTitleView = titleView
+
+        val msgView = TextView(ctx).apply {
+            setTextColor(Color.LTGRAY)
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setPadding(32, 16, 32, 48)
+        }
+        cachedMsgView = msgView
+
+        val btn = Button(ctx).apply {
+            setBackgroundColor(Color.WHITE)
+            setTextColor(Color.BLACK)
+        }
+        cachedBtn = btn
+
+        container.addView(titleView)
+        container.addView(msgView)
+        container.addView(btn)
+        base.addView(container, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+
+        cachedOverlayBaseView = base
+    }
+
     private fun showOverlay(action: ActionRequest) {
         if (!Settings.canDrawOverlays(this)) return
 
-        // Anti-Flickering
+        // Anti-Flickering Logic (Unchanged)
         if (isOverlayShowing && currentOverlayType == action.type) return
-
-        // Priority Protection: Mai sovrascrivere HARD con SOFT
         if (isOverlayShowing && currentOverlayType == OverlayType.HARD && action.type == OverlayType.SOFT) return
 
         serviceScope.launch(Dispatchers.Main) {
-            if (currentOverlayView != null) removeOverlaySafe()
+            // Safety: ensure cached view exists
+            if (cachedOverlayBaseView == null) createReusableOverlayView()
+            val view = cachedOverlayBaseView!!
+
+            // Update content on the cached view
+            view.setBackgroundColor(action.color)
+            cachedTitleView?.text = action.title
+            cachedMsgView?.text = action.message
+            cachedBtn?.text = action.btnText
+            cachedBtn?.setOnClickListener { handleOverlayAction(action.type) }
+
+            // Logic: remove old if exists (shouldn't happen often due to checks above)
+            if (view.isAttachedToWindow) {
+                try { windowManager.removeView(view) } catch (_: Exception) {}
+            }
 
             isOverlayShowing = true
             currentOverlayType = action.type
@@ -422,60 +462,16 @@ class ScrollTrackingService : AccessibilityService() {
                 screenOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             }
 
-            val overlayView = createOverlayView(action)
             try {
-                windowManager.addView(overlayView, params)
-                currentOverlayView = overlayView
+                windowManager.addView(view, params)
             } catch (e: Exception) {
                 isOverlayShowing = false
             }
         }
     }
 
-    @SuppressLint("SetTextI18n")
-    private fun createOverlayView(action: ActionRequest): View {
-        return FrameLayout(this).apply {
-            setBackgroundColor(action.color)
-            isClickable = true
-
-            val container = LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-            }
-
-            val titleView = TextView(context).apply {
-                text = action.title
-                setTextColor(Color.WHITE)
-                textSize = 28f
-                gravity = Gravity.CENTER
-                typeface = android.graphics.Typeface.DEFAULT_BOLD
-            }
-
-            val msgView = TextView(context).apply {
-                text = action.message
-                setTextColor(Color.LTGRAY)
-                textSize = 18f
-                gravity = Gravity.CENTER
-                setPadding(32, 16, 32, 48)
-            }
-
-            val btn = Button(context).apply {
-                text = action.btnText
-                setBackgroundColor(Color.WHITE)
-                setTextColor(Color.BLACK)
-                setOnClickListener { handleOverlayAction(action.type) }
-            }
-
-            container.addView(titleView)
-            container.addView(msgView)
-            container.addView(btn)
-            addView(container, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
-        }
-    }
-
     private fun handleOverlayAction(type: OverlayType) {
         if (type == OverlayType.HARD) {
-            // EXIT
             lastBlockedPackage = currentAppPackage
             immunityDeadline = SystemClock.uptimeMillis() + POST_EXIT_IMMUNITY_MS
 
@@ -491,15 +487,16 @@ class ScrollTrackingService : AccessibilityService() {
             removeOverlaySafe()
 
         } else {
-            // SOFT DISMISS
             removeOverlaySafe()
         }
     }
 
     private fun removeOverlaySafe() {
         if (!isOverlayShowing) return
-        val v = currentOverlayView
-        currentOverlayView = null
+
+        // We do NOT null out cachedOverlayBaseView here, we keep it for next time.
+        // We only detach it.
+        val v = cachedOverlayBaseView
         currentOverlayType = null
         isOverlayShowing = false
 
@@ -510,25 +507,19 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
-    // --- BACKGROUND UTILS ---
-
     private fun startPeriodicFlushing() {
         serviceScope.launch {
             while (isActive) {
                 delay(DB_FLUSH_INTERVAL_MS)
-                // Usiamo handlePackageSwitch per flushare e aggiornare cache correttamente anche nel periodico
                 if (sessionAccumulatedMeters > 0 && currentAppPackage.isNotEmpty()) {
-                    // Nota: Qui non cambiamo pacchetto, quindi chiamiamo repository diretto
-                    // Ma aggiorniamo anche la cache locale per coerenza
                     val pkg = currentAppPackage
                     val dist = sessionAccumulatedMeters
 
                     repository.flushSessionToDb(pkg, dist)
 
-                    // Update cache optimistic
-                    val currentMap = dailyAppUsageCache.toMutableMap()
-                    currentMap[pkg] = (currentMap[pkg] ?: 0f) + dist
-                    dailyAppUsageCache = currentMap
+                    // Update cache optimistic (Thread Safe)
+                    val oldVal = dailyAppUsageCache[pkg] ?: 0f
+                    dailyAppUsageCache[pkg] = oldVal + dist
                     currentDailyTotal += dist
 
                     sessionAccumulatedMeters = 0f

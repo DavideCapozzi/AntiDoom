@@ -13,10 +13,9 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.LocalDate
+import org.json.JSONObject // Used for safer JSON parsing
 
-// --- ENTITIES ---
-
-// 1. RAW DATA (Short Term: 7 Days)
+// --- ENTITIES (Unchanged) ---
 @Entity(
     tableName = "scroll_sessions",
     indices = [
@@ -32,9 +31,6 @@ data class ScrollSession(
     val date: String
 )
 
-// 2. ARCHIVED HISTORY (Long Term: Forever)
-// Questa tabella salva solo il TOTALE giornaliero per ogni app.
-// Composite Primary Key assicura che ci sia una sola riga per App+Data.
 @Entity(
     tableName = "daily_app_history",
     primaryKeys = ["date", "packageName"]
@@ -45,17 +41,14 @@ data class DailyAppHistory(
     val totalMeters: Float
 )
 
-// Helper class for UI logic (unchanged)
 data class AppDistanceTuple(
     @ColumnInfo(name = "packageName") val packageName: String,
     @ColumnInfo(name = "total") val total: Float
 )
 
-// --- DAO ---
-
+// --- DAO (Unchanged) ---
 @Dao
 interface ScrollDao {
-    // --- RAW OPERATIONS ---
     @Insert
     suspend fun insert(session: ScrollSession)
 
@@ -65,10 +58,6 @@ interface ScrollDao {
     @Query("SELECT packageName, COALESCE(SUM(distanceMeters), 0) as total FROM scroll_sessions WHERE date = :date GROUP BY packageName")
     fun getDailyBreakdown(date: String): Flow<List<AppDistanceTuple>>
 
-    // --- ARCHIVING OPERATIONS ---
-
-    // Passo 1: Aggrega i dati grezzi vecchi e li copia nella tabella storico
-    // Usa INSERT OR REPLACE per evitare duplicati se la manutenzione gira due volte
     @Query("""
         INSERT OR REPLACE INTO daily_app_history (date, packageName, totalMeters)
         SELECT date, packageName, SUM(distanceMeters)
@@ -78,26 +67,20 @@ interface ScrollDao {
     """)
     suspend fun archiveOldData(thresholdDate: String)
 
-    // Passo 2: Cancella i dati grezzi che abbiamo appena archiviato
     @Query("DELETE FROM scroll_sessions WHERE date < :thresholdDate")
     suspend fun deleteRawData(thresholdDate: String)
 
-    // Transazione atomica: o fa tutto (copia + cancella) o niente. Sicurezza dati garantita.
     @Transaction
     suspend fun performArchiveAndCleanup(thresholdDate: String) {
         archiveOldData(thresholdDate)
         deleteRawData(thresholdDate)
     }
 
-    // --- FUTURE HISTORY QUERIES (Esempi per il futuro) ---
-    // Potrai usare questa per i grafici storici
     @Query("SELECT * FROM daily_app_history WHERE date BETWEEN :startDate AND :endDate")
     fun getHistoryRange(startDate: String, endDate: String): Flow<List<DailyAppHistory>>
 }
 
-// --- DATABASE ---
-
-// Bumped version to 3 for new History Table
+// --- DATABASE (Unchanged) ---
 @Database(entities = [ScrollSession::class, DailyAppHistory::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun scrollDao(): ScrollDao
@@ -105,33 +88,36 @@ abstract class AppDatabase : RoomDatabase() {
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
         fun get(context: Context): AppDatabase = INSTANCE ?: synchronized(this) {
-            Room.databaseBuilder(context, AppDatabase::class.java, "antidoom.db")
-                .fallbackToDestructiveMigration() // Wipe DB on schema change (Dev mode)
+            Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, "antidoom.db")
+                .fallbackToDestructiveMigration()
                 .build()
                 .also { INSTANCE = it }
         }
     }
 }
 
-// --- PREFERENCES (Unchanged) ---
+// --- PREFERENCES (Optimized) ---
 val Context.dataStore by preferencesDataStore("settings")
 
-class UserPreferences(private val context: Context) {
-    // ... (Il codice di UserPreferences rimane invariato, l'ho omesso per brevità)
-    // Assumo che tu abbia il codice precedente per questa classe.
-    // Se ti serve ricopiato, fammelo sapere.
+class UserPreferences private constructor(private val context: Context) {
 
-    // Keys
+    // Singleton Pattern to prevent multiple instances
+    companion object {
+        @Volatile private var INSTANCE: UserPreferences? = null
+        fun get(context: Context): UserPreferences = INSTANCE ?: synchronized(this) {
+            INSTANCE ?: UserPreferences(context.applicationContext).also { INSTANCE = it }
+        }
+    }
+
     private val trackedAppsKey = stringSetPreferencesKey("tracked_apps")
     private val dailyLimitKey = floatPreferencesKey("daily_limit_meters")
     private val appLimitsKey = stringPreferencesKey("app_limits_json")
     private val generalLockedUntilKey = longPreferencesKey("general_locked_until_ts")
     private val appLockedUntilKey = longPreferencesKey("app_limits_locked_until_ts")
 
-    // Default CORE apps
     private val defaultCoreApps = setOf(
         "com.instagram.android",
-        "com.zhiliaoapp.musically", // TikTok
+        "com.zhiliaoapp.musically",
         "com.ss.android.ugc.trill",
         "com.google.android.youtube"
     )
@@ -196,16 +182,24 @@ class UserPreferences(private val context: Context) {
         }
     }
 
+    // Robust JSON parsing
     private fun parseAppLimits(json: String): Map<String, Float> {
         if (json == "{}" || json.isEmpty()) return emptyMap()
         val map = mutableMapOf<String, Float>()
         try {
-            json.split(",").forEach { entry ->
-                val parts = entry.split(":")
-                if (parts.size == 2) {
-                    val pkg = parts[0]
-                    val limit = parts[1].toFloatOrNull() ?: 0f
-                    map[pkg] = limit
+            // Backward compatibility with "pkg:limit,pkg:limit" format
+            if (!json.startsWith("{")) {
+                json.split(",").forEach { entry ->
+                    val parts = entry.split(":")
+                    if (parts.size == 2) {
+                        map[parts[0]] = parts[1].toFloatOrNull() ?: 0f
+                    }
+                }
+            } else {
+                // Future proofing for standard JSON
+                val jsonObj = JSONObject(json)
+                jsonObj.keys().forEach { key ->
+                    map[key] = jsonObj.getDouble(key).toFloat()
                 }
             }
         } catch (e: Exception) { e.printStackTrace() }
@@ -217,16 +211,13 @@ class UserPreferences(private val context: Context) {
     }
 }
 
-// --- REPOSITORY ---
-
+// --- REPOSITORY (Unchanged) ---
 class ScrollRepository private constructor(context: Context) {
     private val db = AppDatabase.get(context)
     private val _activeSessionDistance = MutableStateFlow(0f)
     private val repoScope = CoroutineScope(Dispatchers.IO)
 
     init {
-        // MAINTENANCE ROUTINE
-        // Sposta i dati vecchi (> 7 giorni) nello storico e pulisce il raw.
         repoScope.launch {
             try {
                 val thresholdDate = LocalDate.now().minusDays(7).toString()
@@ -250,7 +241,6 @@ class ScrollRepository private constructor(context: Context) {
 
     suspend fun flushSessionToDb(packageName: String, distance: Float) {
         if (distance <= 0) return
-
         try {
             val session = ScrollSession(
                 packageName = packageName,
@@ -268,8 +258,7 @@ class ScrollRepository private constructor(context: Context) {
     fun getDailyAppDistancesFlow(date: String): Flow<Map<String, Float>> {
         return db.scrollDao().getDailyBreakdown(date)
             .combine(_activeSessionDistance) { dbList, _ ->
-                val map = dbList.associate { it.packageName to it.total }.toMutableMap()
-                map
+                dbList.associate { it.packageName to it.total }.toMutableMap()
             }
     }
 

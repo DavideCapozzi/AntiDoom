@@ -31,7 +31,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun LimitSettingsScreen(navController: NavController) {
     val context = LocalContext.current
-    val prefs = remember { UserPreferences(context) }
+    val prefs = remember { UserPreferences.get(context) }
     val scope = rememberCoroutineScope()
 
     val currentGlobalLimit by prefs.dailyLimit.collectAsState(initial = 100f)
