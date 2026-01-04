@@ -5,20 +5,15 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
@@ -43,13 +38,9 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.antidoom.app.data.ScrollRepository
-import com.antidoom.app.data.UserPreferences
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.time.LocalDate
 import coil.compose.rememberAsyncImagePainter
+import com.antidoom.app.data.ScrollRepository
+import java.time.LocalDate
 
 // Navigation Routes
 sealed class Screen(val route: String, val label: String? = null, val icon: ImageVector? = null) {
@@ -59,6 +50,12 @@ sealed class Screen(val route: String, val label: String? = null, val icon: Imag
     data object SettingsApps : Screen("settings/apps")
     data object SettingsAccessibility : Screen("settings/accessibility")
 }
+
+// OPTIMIZED: Removed 'Drawable' to prevent OutOfMemoryErrors with large app lists
+data class AppInfo(
+    val label: String,
+    val packageName: String
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -146,7 +143,9 @@ fun StatsScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Optimization: remember repository instance
     val repository = remember { ScrollRepository.get(context) }
+
     val todayDistance by key(currentDate) {
         repository.getDailyDistanceFlow(currentDate).collectAsState(initial = 0f)
     }
@@ -215,12 +214,6 @@ fun SettingsItem(title: String, subtitle: String, icon: ImageVector, onClick: ()
         }
     }
 }
-
-data class AppInfo(
-    val label: String,
-    val packageName: String,
-    val icon: Drawable
-)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -292,6 +285,26 @@ fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     ) {
         Text(text)
     }
+}
+
+// --- HELPER FOR ICONS (New Optimization) ---
+@Composable
+fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val icon = remember(packageName) {
+        try {
+            context.packageManager.getApplicationIcon(packageName)
+        } catch (e: Exception) {
+            // Fallback icon or null
+            ContextCompat.getDrawable(context, android.R.drawable.sym_def_app_icon)
+        }
+    }
+
+    Image(
+        painter = rememberAsyncImagePainter(icon),
+        contentDescription = null,
+        modifier = modifier
+    )
 }
 
 fun checkAccessibilityService(context: Context): Boolean {

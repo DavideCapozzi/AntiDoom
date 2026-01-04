@@ -2,7 +2,6 @@ package com.antidoom.app.ui
 
 import android.content.pm.PackageManager
 import android.widget.Toast
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,7 +20,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
-import coil.compose.rememberAsyncImagePainter
 import com.antidoom.app.data.UserPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,17 +41,13 @@ fun LimitSettingsScreen(navController: NavController) {
     val trackedAppsPackageNames by prefs.trackedApps.collectAsState(initial = emptySet())
     val appLimits by prefs.appLimits.collectAsState(initial = emptyMap())
 
-    // State per le app risolte (con icona e label)
     var activeAppsList by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
 
-    // State for Per-App Limit Dialog
     var showDialogForPackage by remember { mutableStateOf<String?>(null) }
-
-    // State for Lock Confirmation Dialogs
     var showGeneralLockConfirm by remember { mutableStateOf(false) }
     var showAppLockConfirm by remember { mutableStateOf(false) }
 
-    // Effetto per caricare le info delle app
+    // Optimization: Don't load icons here, just labels
     LaunchedEffect(trackedAppsPackageNames) {
         withContext(Dispatchers.IO) {
             val pm = context.packageManager
@@ -62,8 +56,8 @@ fun LimitSettingsScreen(navController: NavController) {
                     val appInfo = pm.getApplicationInfo(packageName, 0)
                     AppInfo(
                         label = pm.getApplicationLabel(appInfo).toString(),
-                        packageName = packageName,
-                        icon = pm.getApplicationIcon(appInfo)
+                        packageName = packageName
+                        // Icon removed for performance
                     )
                 } catch (e: PackageManager.NameNotFoundException) {
                     null
@@ -175,7 +169,7 @@ fun LimitSettingsScreen(navController: NavController) {
                     AppLimitItem(
                         appInfo = app,
                         currentLimit = limit,
-                        isLocked = isAppLimitsLocked, // Using separate lock
+                        isLocked = isAppLimitsLocked,
                         onClick = { showDialogForPackage = app.packageName }
                     )
                 }
@@ -296,9 +290,9 @@ fun AppLimitItem(
             modifier = Modifier.padding(vertical = 12.dp, horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Image(
-                painter = rememberAsyncImagePainter(appInfo.icon),
-                contentDescription = null,
+            // Using helper for icon
+            PackageIcon(
+                packageName = appInfo.packageName,
                 modifier = Modifier.size(40.dp)
             )
             Spacer(modifier = Modifier.width(16.dp))

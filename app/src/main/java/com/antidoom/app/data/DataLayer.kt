@@ -13,7 +13,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.LocalDate
-import org.json.JSONObject // Used for safer JSON parsing
 
 // --- ENTITIES (Unchanged) ---
 @Entity(
@@ -101,7 +100,6 @@ val Context.dataStore by preferencesDataStore("settings")
 
 class UserPreferences private constructor(private val context: Context) {
 
-    // Singleton Pattern to prevent multiple instances
     companion object {
         @Volatile private var INSTANCE: UserPreferences? = null
         fun get(context: Context): UserPreferences = INSTANCE ?: synchronized(this) {
@@ -165,14 +163,14 @@ class UserPreferences private constructor(private val context: Context) {
     }
 
     val appLimits: Flow<Map<String, Float>> = context.dataStore.data.map { prefs ->
-        val json = prefs[appLimitsKey] ?: "{}"
-        parseAppLimits(json)
+        val json = prefs[appLimitsKey] ?: ""
+        parseAppLimitsOptimized(json)
     }
 
     suspend fun updateAppLimit(packageName: String, limit: Float?) {
         context.dataStore.edit { prefs ->
-            val currentJson = prefs[appLimitsKey] ?: "{}"
-            val currentMap = parseAppLimits(currentJson).toMutableMap()
+            val currentJson = prefs[appLimitsKey] ?: ""
+            val currentMap = parseAppLimitsOptimized(currentJson).toMutableMap()
             if (limit == null) {
                 currentMap.remove(packageName)
             } else {
@@ -182,27 +180,36 @@ class UserPreferences private constructor(private val context: Context) {
         }
     }
 
-    // Robust JSON parsing
-    private fun parseAppLimits(json: String): Map<String, Float> {
-        if (json == "{}" || json.isEmpty()) return emptyMap()
-        val map = mutableMapOf<String, Float>()
-        try {
-            // Backward compatibility with "pkg:limit,pkg:limit" format
-            if (!json.startsWith("{")) {
-                json.split(",").forEach { entry ->
-                    val parts = entry.split(":")
-                    if (parts.size == 2) {
-                        map[parts[0]] = parts[1].toFloatOrNull() ?: 0f
-                    }
-                }
-            } else {
-                // Future proofing for standard JSON
-                val jsonObj = JSONObject(json)
+    // OPTIMIZED: Replaced JSONObject with manual parsing for better performance
+    // Format is "pkg1:limit1,pkg2:limit2"
+    private fun parseAppLimitsOptimized(raw: String): Map<String, Float> {
+        if (raw.isEmpty() || raw == "{}") return emptyMap()
+
+        // Handle legacy JSON case if needed, otherwise stick to simple string splitting
+        if (raw.startsWith("{") && raw.contains("\"")) {
+            // Fallback for legacy JSON data, convert to new format lazily
+            return try {
+                val map = mutableMapOf<String, Float>()
+                val jsonObj = org.json.JSONObject(raw)
                 jsonObj.keys().forEach { key ->
                     map[key] = jsonObj.getDouble(key).toFloat()
                 }
+                map
+            } catch (e: Exception) { emptyMap() }
+        }
+
+        // Fast path
+        val map = mutableMapOf<String, Float>()
+        val entries = raw.split(',')
+        for (entry in entries) {
+            val idx = entry.lastIndexOf(':')
+            if (idx != -1) {
+                val pkg = entry.substring(0, idx)
+                val limitStr = entry.substring(idx + 1)
+                val limit = limitStr.toFloatOrNull() ?: 0f
+                map[pkg] = limit
             }
-        } catch (e: Exception) { e.printStackTrace() }
+        }
         return map
     }
 

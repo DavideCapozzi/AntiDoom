@@ -1,9 +1,7 @@
 package com.antidoom.app.ui
 
 import android.content.Intent
-import android.graphics.drawable.Drawable
 import android.widget.Toast
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -19,7 +17,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
-import coil.compose.rememberAsyncImagePainter
 import com.antidoom.app.data.UserPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -29,7 +26,6 @@ import kotlinx.coroutines.withContext
 @Composable
 fun AppsSettingsScreen(navController: NavController) {
     val context = LocalContext.current
-    // OPTIMIZATION: Use singleton instance
     val prefs = remember { UserPreferences.get(context) }
     val scope = rememberCoroutineScope()
 
@@ -57,12 +53,12 @@ fun AppsSettingsScreen(navController: NavController) {
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
+            // Optimization: We do NOT load Drawables here anymore to save memory
             val apps = pm.queryIntentActivities(intent, 0)
                 .map { resolveInfo ->
                     AppInfo(
                         label = resolveInfo.loadLabel(pm).toString(),
-                        packageName = resolveInfo.activityInfo.packageName,
-                        icon = resolveInfo.loadIcon(pm)
+                        packageName = resolveInfo.activityInfo.packageName
                     )
                 }
                 .filter { it.packageName != context.packageName }
@@ -74,7 +70,6 @@ fun AppsSettingsScreen(navController: NavController) {
         }
     }
 
-    // OPTIMIZATION: Memoize list filtering to avoid recalculation on every recomposition
     val coreAppsList = remember(installedApps) {
         installedApps.filter { it.packageName in corePackages }
     }
@@ -144,7 +139,7 @@ fun AppsSettingsScreen(navController: NavController) {
                         )
                     }
                 }
-                // Use key for performance
+
                 items(otherAppsList, key = { it.packageName }) { app ->
                     AppItem(app, app.packageName in trackedApps, isLocked) { isChecked ->
                         if (isLocked) {
@@ -167,17 +162,17 @@ fun AppItem(app: AppInfo, isTracked: Boolean, isLocked: Boolean, onToggle: (Bool
     ListItem(
         headlineContent = { Text(app.label) },
         leadingContent = {
-            Image(
-                painter = rememberAsyncImagePainter(app.icon),
-                contentDescription = null,
+            // Using the new helper composable for memory efficiency
+            PackageIcon(
+                packageName = app.packageName,
                 modifier = Modifier.size(40.dp)
             )
         },
         trailingContent = {
             Checkbox(
                 checked = isTracked,
-                onCheckedChange = onToggle, // logic handled inside callback
-                enabled = !isLocked, // Visual disable
+                onCheckedChange = onToggle,
+                enabled = !isLocked,
                 colors = CheckboxDefaults.colors(
                     disabledCheckedColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
                 )
