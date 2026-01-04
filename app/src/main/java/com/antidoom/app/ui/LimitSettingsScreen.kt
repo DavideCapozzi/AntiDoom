@@ -34,7 +34,7 @@ fun LimitSettingsScreen(navController: NavController) {
 
     val currentGlobalLimit by prefs.dailyLimit.collectAsState(initial = 100f)
 
-    // TWO SEPARATE LOCK STATES
+    // Two separate lock states
     val isGeneralLocked by prefs.isGeneralLocked.collectAsState(initial = false)
     val isAppLimitsLocked by prefs.isAppLimitsLocked.collectAsState(initial = false)
 
@@ -47,7 +47,7 @@ fun LimitSettingsScreen(navController: NavController) {
     var showGeneralLockConfirm by remember { mutableStateOf(false) }
     var showAppLockConfirm by remember { mutableStateOf(false) }
 
-    // Optimization: Don't load icons here, just labels
+    // Optimization: Load labels only, icon loading is handled by PackageIcon
     LaunchedEffect(trackedAppsPackageNames) {
         withContext(Dispatchers.IO) {
             val pm = context.packageManager
@@ -57,7 +57,6 @@ fun LimitSettingsScreen(navController: NavController) {
                     AppInfo(
                         label = pm.getApplicationLabel(appInfo).toString(),
                         packageName = packageName
-                        // Icon removed for performance
                     )
                 } catch (e: PackageManager.NameNotFoundException) {
                     null
@@ -290,7 +289,7 @@ fun AppLimitItem(
             modifier = Modifier.padding(vertical = 12.dp, horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Using helper for icon
+            // Using helper for icon from MainActivity
             PackageIcon(
                 packageName = appInfo.packageName,
                 modifier = Modifier.size(40.dp)

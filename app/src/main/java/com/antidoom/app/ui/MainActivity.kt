@@ -5,6 +5,7 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -40,6 +41,8 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coil.compose.rememberAsyncImagePainter
 import com.antidoom.app.data.ScrollRepository
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 
 // Navigation Routes
@@ -51,7 +54,7 @@ sealed class Screen(val route: String, val label: String? = null, val icon: Imag
     data object SettingsAccessibility : Screen("settings/accessibility")
 }
 
-// OPTIMIZED: Removed 'Drawable' to prevent OutOfMemoryErrors with large app lists
+// Shared Data Model
 data class AppInfo(
     val label: String,
     val packageName: String
@@ -270,7 +273,6 @@ fun AccessibilitySettingsScreen(navController: NavController) {
     }
 }
 
-// Reusing existing helper components
 @Composable
 fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     Button(
@@ -287,24 +289,32 @@ fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-// --- HELPER FOR ICONS (New Optimization) ---
+// --- OPTIMIZED ICON LOADER ---
 @Composable
 fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    val icon = remember(packageName) {
-        try {
-            context.packageManager.getApplicationIcon(packageName)
-        } catch (e: Exception) {
-            // Fallback icon or null
-            ContextCompat.getDrawable(context, android.R.drawable.sym_def_app_icon)
+
+    // Asynchronously load the icon to prevent Main Thread blocking
+    val iconState = produceState<Drawable?>(initialValue = null, key1 = packageName) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                context.packageManager.getApplicationIcon(packageName)
+            } catch (e: Exception) {
+                ContextCompat.getDrawable(context, android.R.drawable.sym_def_app_icon)
+            }
         }
     }
 
-    Image(
-        painter = rememberAsyncImagePainter(icon),
-        contentDescription = null,
-        modifier = modifier
-    )
+    if (iconState.value != null) {
+        Image(
+            painter = rememberAsyncImagePainter(iconState.value),
+            contentDescription = null,
+            modifier = modifier
+        )
+    } else {
+        // Placeholder to maintain layout stability
+        Box(modifier = modifier)
+    }
 }
 
 fun checkAccessibilityService(context: Context): Boolean {

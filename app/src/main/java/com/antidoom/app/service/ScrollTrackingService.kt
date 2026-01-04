@@ -251,7 +251,7 @@ class ScrollTrackingService : AccessibilityService() {
         return if (delta > 0) delta else 0
     }
 
-    // --- ENFORCEMENT LOGIC (PRESERVED) ---
+    // --- ENFORCEMENT LOGIC ---
     private fun checkEnforcementState(source: String) {
         if (currentAppPackage !in trackedAppsCache) {
             if (isOverlayShowing) removeOverlaySafe()
@@ -353,7 +353,7 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
-    // --- OVERLAY MANAGEMENT (Logic Preserved, Code Cleaned) ---
+    // --- OVERLAY MANAGEMENT ---
     data class ActionRequest(val type: OverlayType, val title: String, val message: String, val btnText: String, val color: Int)
     enum class OverlayType { HARD, SOFT }
 
@@ -402,7 +402,7 @@ class ScrollTrackingService : AccessibilityService() {
     private fun showOverlay(action: ActionRequest) {
         if (!Settings.canDrawOverlays(this)) return
 
-        // EXACT LOGIC FROM ORIGINAL FILE TO PREVENT FLICKER
+        // Prevent flicker by checking existing overlay type
         if (isOverlayShowing && currentOverlayType == action.type) return
         if (isOverlayShowing && currentOverlayType == OverlayType.HARD && action.type == OverlayType.SOFT) return
 
@@ -416,7 +416,7 @@ class ScrollTrackingService : AccessibilityService() {
             cachedBtn?.text = action.btnText
             cachedBtn?.setOnClickListener { handleOverlayAction(action.type) }
 
-            // Logic maintained: Remove before Add (proven stable by user)
+            // Logic maintained: Remove before Add (proven stable)
             if (view.isAttachedToWindow) {
                 try { windowManager.removeView(view) } catch (_: Exception) {}
             }

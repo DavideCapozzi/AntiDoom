@@ -14,7 +14,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.LocalDate
 
-// --- ENTITIES (Unchanged) ---
+// --- ENTITIES ---
 @Entity(
     tableName = "scroll_sessions",
     indices = [
@@ -45,7 +45,7 @@ data class AppDistanceTuple(
     @ColumnInfo(name = "total") val total: Float
 )
 
-// --- DAO (Unchanged) ---
+// --- DAO ---
 @Dao
 interface ScrollDao {
     @Insert
@@ -79,7 +79,7 @@ interface ScrollDao {
     fun getHistoryRange(startDate: String, endDate: String): Flow<List<DailyAppHistory>>
 }
 
-// --- DATABASE (Unchanged) ---
+// --- DATABASE ---
 @Database(entities = [ScrollSession::class, DailyAppHistory::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun scrollDao(): ScrollDao
@@ -95,7 +95,7 @@ abstract class AppDatabase : RoomDatabase() {
     }
 }
 
-// --- PREFERENCES (Optimized) ---
+// --- PREFERENCES ---
 val Context.dataStore by preferencesDataStore("settings")
 
 class UserPreferences private constructor(private val context: Context) {
@@ -180,14 +180,13 @@ class UserPreferences private constructor(private val context: Context) {
         }
     }
 
-    // OPTIMIZED: Replaced JSONObject with manual parsing for better performance
     // Format is "pkg1:limit1,pkg2:limit2"
     private fun parseAppLimitsOptimized(raw: String): Map<String, Float> {
         if (raw.isEmpty() || raw == "{}") return emptyMap()
 
         // Handle legacy JSON case if needed, otherwise stick to simple string splitting
         if (raw.startsWith("{") && raw.contains("\"")) {
-            // Fallback for legacy JSON data, convert to new format lazily
+            // Fallback for legacy JSON data
             return try {
                 val map = mutableMapOf<String, Float>()
                 val jsonObj = org.json.JSONObject(raw)
@@ -198,7 +197,7 @@ class UserPreferences private constructor(private val context: Context) {
             } catch (e: Exception) { emptyMap() }
         }
 
-        // Fast path
+        // Fast path string parsing
         val map = mutableMapOf<String, Float>()
         val entries = raw.split(',')
         for (entry in entries) {
@@ -218,7 +217,7 @@ class UserPreferences private constructor(private val context: Context) {
     }
 }
 
-// --- REPOSITORY (Unchanged) ---
+// --- REPOSITORY ---
 class ScrollRepository private constructor(context: Context) {
     private val db = AppDatabase.get(context)
     private val _activeSessionDistance = MutableStateFlow(0f)
