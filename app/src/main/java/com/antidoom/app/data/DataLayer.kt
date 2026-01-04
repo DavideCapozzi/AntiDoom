@@ -40,14 +40,16 @@ data class DailyAppHistory(
     val totalMeters: Float
 )
 
+// Tuple for simple lists
 data class AppDistanceTuple(
     @ColumnInfo(name = "packageName") val packageName: String,
     @ColumnInfo(name = "total") val total: Float
 )
 
-// NEW: Data class for Weekly Chart
-data class DailyTotalTuple(
+// NEW: Tuple for the stacked bar chart (Detailed breakdown)
+data class DailyAppSegmentTuple(
     @ColumnInfo(name = "date") val date: String,
+    @ColumnInfo(name = "packageName") val packageName: String,
     @ColumnInfo(name = "total") val total: Float
 )
 
@@ -63,15 +65,16 @@ interface ScrollDao {
     @Query("SELECT packageName, COALESCE(SUM(distanceMeters), 0) as total FROM scroll_sessions WHERE date = :date GROUP BY packageName")
     fun getDailyBreakdown(date: String): Flow<List<AppDistanceTuple>>
 
-    // NEW: Get daily totals for the last 7 days for the chart
+    // NEW: Get detailed breakdown for the last X days.
+    // Optimized to filter by date at SQL level to prevent reading full history.
     @Query("""
-        SELECT date, COALESCE(SUM(distanceMeters), 0) as total 
+        SELECT date, packageName, COALESCE(SUM(distanceMeters), 0) as total 
         FROM scroll_sessions 
-        GROUP BY date 
-        ORDER BY date DESC 
-        LIMIT 7
+        WHERE date >= :minDate
+        GROUP BY date, packageName
+        ORDER BY date DESC
     """)
-    fun getLast7DaysTotals(): Flow<List<DailyTotalTuple>>
+    fun getWeeklyAppBreakdown(minDate: String): Flow<List<DailyAppSegmentTuple>>
 
     @Query("""
         INSERT OR REPLACE INTO daily_app_history (date, packageName, totalMeters)
@@ -90,9 +93,6 @@ interface ScrollDao {
         archiveOldData(thresholdDate)
         deleteRawData(thresholdDate)
     }
-
-    @Query("SELECT * FROM daily_app_history WHERE date BETWEEN :startDate AND :endDate")
-    fun getHistoryRange(startDate: String, endDate: String): Flow<List<DailyAppHistory>>
 }
 
 // --- DATABASE ---
@@ -238,6 +238,7 @@ class ScrollRepository private constructor(context: Context) {
     init {
         repoScope.launch {
             try {
+                // Keep only last 7 days of raw data, archive the rest
                 val thresholdDate = LocalDate.now().minusDays(7).toString()
                 db.scrollDao().performArchiveAndCleanup(thresholdDate)
             } catch (e: Exception) {
@@ -253,12 +254,10 @@ class ScrollRepository private constructor(context: Context) {
             }
     }
 
-    // NEW: Expose weekly stats
-    fun getLast7DaysStats(): Flow<List<DailyTotalTuple>> {
-        return db.scrollDao().getLast7DaysTotals()
-        // Note: We are not combining with _activeSessionDistance here to keep it simple
-        // and because historical days don't change.
-        // For "Today", it might lag slightly behind the live counter on Home, which is acceptable for a generic chart.
+    // NEW: Expose weekly stats with explicit date filter
+    fun getWeeklyAppBreakdown(): Flow<List<DailyAppSegmentTuple>> {
+        val minDate = LocalDate.now().minusDays(6).toString() // Last 7 days inclusive
+        return db.scrollDao().getWeeklyAppBreakdown(minDate)
     }
 
     fun updateActiveDistance(meters: Float) {

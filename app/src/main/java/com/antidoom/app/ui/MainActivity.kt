@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.os.Build
 import android.os.Bundle
@@ -16,9 +15,12 @@ import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -30,7 +32,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.BitmapPainter
@@ -38,10 +41,11 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.ExperimentalTextApi
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -52,6 +56,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.antidoom.app.data.DailyAppSegmentTuple
 import com.antidoom.app.data.ScrollRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -59,10 +64,12 @@ import java.time.LocalDate
 import java.time.format.TextStyle
 import java.util.Locale
 
-// UPDATE: Changed Stats icon to ShowChart (Graph), maintained Home
+// NOTE: We do NOT import android.graphics.Canvas here to avoid conflict with Compose Canvas.
+// We use fully qualified name 'android.graphics.Canvas' in PackageIcon instead.
+
 sealed class Screen(val route: String, val label: String? = null, val icon: ImageVector? = null) {
     data object Home : Screen("home", "Home", Icons.Filled.Home)
-    data object Stats : Screen("stats", "Stats", Icons.AutoMirrored.Filled.ShowChart) // UPDATE: Graph Icon
+    data object Stats : Screen("stats", "Stats", Icons.AutoMirrored.Filled.ShowChart)
     data object Settings : Screen("settings", "Settings", Icons.Filled.Settings)
     data object SettingsLimits : Screen("settings/limits")
     data object SettingsApps : Screen("settings/apps")
@@ -74,7 +81,6 @@ data class AppInfo(
     val packageName: String
 )
 
-// Optimized LRU Cache for Bitmaps
 object IconCache {
     private val maxMemory = (Runtime.getRuntime().maxMemory() / 1024).toInt()
     private val cacheSize = maxMemory / 8
@@ -118,7 +124,6 @@ fun AntiDoomApp() {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
 
-    // UPDATE: Reordered items: Stats - Home - Settings (Home in Center)
     val bottomNavItems = listOf(Screen.Stats, Screen.Home, Screen.Settings)
     val showBottomBar = bottomNavItems.any { it.route == currentDestination?.route }
 
@@ -130,7 +135,6 @@ fun AntiDoomApp() {
                         bottomNavItems.forEach { screen ->
                             NavigationBarItem(
                                 icon = { Icon(screen.icon!!, contentDescription = screen.label) },
-                                // UPDATE: Labels removed by not providing a Text composable or string
                                 label = null,
                                 selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
                                 onClick = {
@@ -199,100 +203,215 @@ fun HomeScreen() {
     }
 }
 
-// UPDATE: StatsScreen with Bar Chart
+// --- STATS & CHART LOGIC ---
+
+data class ChartDayData(
+    val dayLabel: String,
+    val date: String,
+    val segments: List<ChartSegment>,
+    val total: Float
+)
+
+data class ChartSegment(
+    val value: Float,
+    val color: Color,
+    val label: String? = null
+)
+
+val ChartPalette = listOf(
+    Color(0xFF3F51B5), // Indigo
+    Color(0xFFE91E63), // Pink
+    Color(0xFF009688), // Teal
+    Color(0xFFFF9800), // Orange
+    Color(0xFF9C27B0)  // Purple
+)
+val ColorOthers = Color.LightGray
+
+@OptIn(ExperimentalTextApi::class)
 @Composable
 fun StatsScreen() {
     val context = LocalContext.current
     val repository = remember { ScrollRepository.get(context) }
 
-    // Fetch last 7 days stats
-    val weeklyStats by repository.getLast7DaysStats().collectAsState(initial = emptyList())
+    val rawData by repository.getWeeklyAppBreakdown().collectAsState(initial = emptyList())
+
+    val chartData = remember(rawData) {
+        processDataForStackedChart(rawData)
+    }
+
+    val legendItems = remember(chartData) {
+        chartData.flatMap { it.segments }
+            .filter { it.label != null }
+            .distinctBy { it.label }
+            .sortedByDescending { segment ->
+                chartData.sumOf { day -> day.segments.find { it.label == segment.label }?.value?.toDouble() ?: 0.0 }
+            }
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("Weekly Trends", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
-        Spacer(modifier = Modifier.height(32.dp))
+        Text("Weekly Breakdown", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
+        Spacer(modifier = Modifier.height(8.dp))
+        Text("Top 5 Apps + Others", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
 
-        if (weeklyStats.isEmpty()) {
+        Spacer(modifier = Modifier.height(24.dp))
+
+        if (chartData.isEmpty()) {
             Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
+                Text("No data yet", color = Color.Gray)
             }
         } else {
-            // Chart Container
-            Column(
+            StackedBarChart(
+                data = chartData,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(300.dp)
+                    .height(250.dp)
                     .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.Bottom
-            ) {
-                // Find max value for scaling (min 10m to avoid division by zero or huge bars for small data)
-                val maxVal = weeklyStats.maxOfOrNull { it.total }?.coerceAtLeast(10f) ?: 10f
+                    .padding(16.dp)
+            )
 
-                // Prepare data for the last 7 days (fill missing days with 0)
-                val chartData = remember(weeklyStats) {
-                    val end = LocalDate.now()
-                    (0..6).map { i ->
-                        val date = end.minusDays(6L - i)
-                        val dateStr = date.toString()
-                        val value = weeklyStats.find { it.date == dateStr }?.total ?: 0f
-                        val dayLabel = date.dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.getDefault()).take(1)
-                        Triple(dayLabel, value, value / maxVal)
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Text("Legend", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                items(legendItems) { segment ->
+                    Row(
+                        modifier = Modifier.padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(modifier = Modifier.size(12.dp).background(segment.color, CircleShape))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        val cleanName = segment.label?.substringAfterLast('.')
+                            ?.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                            ?: "Unknown"
+                        Text(cleanName, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth().height(200.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    chartData.forEach { (label, value, fraction) ->
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Bottom,
-                            modifier = Modifier.weight(1f).fillMaxHeight()
-                        ) {
-                            // Value Text (if enough space)
-                            if (fraction > 0.1f) {
-                                Text(
-                                    text = "${value.toInt()}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            // The Bar
-                            Box(
-                                modifier = Modifier
-                                    .width(12.dp)
-                                    .fillMaxHeight(fraction.coerceAtLeast(0.02f)) // Min height for visibility
-                                    .clip(RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp))
-                                    .background(MaterialTheme.colorScheme.primary)
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // Day Label
-                            Text(
-                                text = label,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
+                item {
+                    Row(
+                        modifier = Modifier.padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(modifier = Modifier.size(12.dp).background(ColorOthers, CircleShape))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Others (Minor Apps)", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("Last 7 Days (Meters)", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
         }
     }
 }
+
+fun processDataForStackedChart(raw: List<DailyAppSegmentTuple>): List<ChartDayData> {
+    if (raw.isEmpty()) return emptyList()
+
+    val today = LocalDate.now()
+
+    val appTotals = raw.groupBy { it.packageName }
+        .mapValues { entry -> entry.value.sumOf { it.total.toDouble() }.toFloat() }
+        .toList()
+        .sortedByDescending { it.second }
+
+    val topApps = appTotals.take(5).map { it.first }.toSet()
+
+    val colorMap = topApps.mapIndexed { index, pkg ->
+        pkg to ChartPalette.getOrElse(index) { Color.Gray }
+    }.toMap()
+
+    return (0..6).map { i ->
+        val date = today.minusDays(6L - i)
+        val dateStr = date.toString()
+        val dayLabel = date.dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.getDefault()).take(1)
+
+        val dayEntries = raw.filter { it.date == dateStr }
+
+        val segments = mutableListOf<ChartSegment>()
+        var othersTotal = 0f
+
+        dayEntries.forEach { entry ->
+            if (entry.packageName in topApps) {
+                segments.add(ChartSegment(
+                    value = entry.total,
+                    color = colorMap[entry.packageName] ?: Color.Gray,
+                    label = entry.packageName
+                ))
+            } else {
+                othersTotal += entry.total
+            }
+        }
+
+        if (othersTotal > 0) {
+            segments.add(ChartSegment(othersTotal, ColorOthers, null))
+        }
+
+        segments.sortBy { if (it.label == null) 999 else topApps.indexOf(it.label) }
+
+        ChartDayData(
+            dayLabel = dayLabel,
+            date = dateStr,
+            segments = segments,
+            total = segments.sumOf { it.value.toDouble() }.toFloat()
+        )
+    }
+}
+
+@OptIn(ExperimentalTextApi::class)
+@Composable
+fun StackedBarChart(
+    data: List<ChartDayData>,
+    modifier: Modifier = Modifier
+) {
+    val textMeasurer = rememberTextMeasurer()
+    val labelStyle = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurface)
+
+    Canvas(modifier = modifier) {
+        val maxVal = data.maxOfOrNull { it.total }?.coerceAtLeast(10f) ?: 10f
+
+        val chartBottom = size.height - 20.dp.toPx()
+        val chartHeight = chartBottom
+
+        val barWidth = size.width / (data.size * 2f)
+        val spacing = size.width / data.size
+
+        data.forEachIndexed { index, dayData ->
+            val xOffset = (index * spacing) + (spacing / 2) - (barWidth / 2)
+
+            var currentY = chartBottom
+
+            dayData.segments.forEach { segment ->
+                val segmentHeight = (segment.value / maxVal) * chartHeight
+
+                if (segmentHeight > 0) {
+                    drawRect(
+                        color = segment.color,
+                        topLeft = Offset(xOffset, currentY - segmentHeight),
+                        size = Size(barWidth, segmentHeight)
+                    )
+                    currentY -= segmentHeight
+                }
+            }
+
+            val measuredText = textMeasurer.measure(dayData.dayLabel, labelStyle)
+
+            val textWidth = measuredText.size.width.toFloat()
+            val textX = xOffset + (barWidth / 2) - (textWidth / 2)
+
+            drawText(
+                textLayoutResult = measuredText,
+                topLeft = Offset(
+                    textX,
+                    size.height - 15.dp.toPx()
+                )
+            )
+        }
+    }
+}
+
+// ... Settings Screens ...
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -415,7 +534,6 @@ fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-// Optimized Async Icon Loader
 @Composable
 fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -438,7 +556,10 @@ fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
                     drawable.bitmap
                 } else {
                     val bitmap = Bitmap.createBitmap(targetSizePx, targetSizePx, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(bitmap)
+
+                    // FIX: Fully qualified reference to Android Graphics Canvas to avoid conflict
+                    val canvas = android.graphics.Canvas(bitmap)
+
                     drawable.setBounds(0, 0, canvas.width, canvas.height)
                     drawable.draw(canvas)
                     IconCache.put(packageName, bitmap)
