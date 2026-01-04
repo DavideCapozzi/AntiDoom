@@ -6,14 +6,16 @@ import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
-import android.content.pm.ActivityInfo
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -43,56 +45,52 @@ class ScrollTrackingService : AccessibilityService() {
     companion object {
         private const val PIXELS_PER_METER = 3500f
         private const val FALLBACK_SCROLL_PIXELS = 1500
-        private const val UI_UPDATE_INTERVAL_MS = 2000L
+        private const val UI_UPDATE_INTERVAL_MS = 1000L
         private const val DB_FLUSH_INTERVAL_MS = 30_000L
-        private const val MIN_DIST_TO_UPDATE_UI = 5f
-
-        // CRITICAL TUNING:
-        // 800ms è il "Magic Number". È sufficiente per coprire l'animazione di chiusura (evita Double Overlay)
-        // ma abbastanza breve da sembrare istantaneo se l'utente riapre l'app subito.
+        private const val MIN_DIST_TO_UPDATE_UI = 2f
         private const val POST_EXIT_IMMUNITY_MS = 800L
+
+        // Thresholds
+        private const val THRESHOLD_WARN = 0.25f
+        private const val THRESHOLD_SOFT = 0.50f
     }
+
+    private data class EnforcementState(
+        var warned25: Boolean = false,
+        var softBlocked50: Boolean = false
+    )
+    private val enforcementStates = mutableMapOf<String, EnforcementState>()
 
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
     private lateinit var repository: ScrollRepository
     private lateinit var prefs: UserPreferences
     private lateinit var windowManager: WindowManager
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    // --- DATA & CONFIG ---
+    // --- DATA CACHE (Volatile & Optimistic) ---
+    // Usiamo mappe immutabili rimpiazzate atomicamente per thread-safety senza lock complessi
     @Volatile private var trackedAppsCache: Set<String> = emptySet()
     @Volatile private var appLimitsCache: Map<String, Float> = emptyMap()
     @Volatile private var globalLimitMeters: Float = 100f
 
+    // Critical: Questa cache deve essere aggiornata ottimisticamente
+    @Volatile private var dailyAppUsageCache: Map<String, Float> = emptyMap()
     @Volatile private var currentDailyTotal: Float = 0f
-    private var dailyAppUsageCache: Map<String, Float> = emptyMap()
 
-    // --- SESSION STATE ---
+    // Session State
     @Volatile private var currentAppPackage: String = ""
     private var sessionAccumulatedMeters = 0f
     private var lastUiUpdateTimestamp = 0L
     private var lastUiUpdateDistance = 0f
 
-    // --- IMMUNITY CONTROL ---
-    // Uptime timestamp fino al quale ignoriamo STRICTLY i pacchetti bloccati.
+    // Immunity & UI
     @Volatile private var immunityDeadline: Long = 0L
     private var lastBlockedPackage: String = ""
-
-    // --- UI STATE ---
     private var isOverlayShowing = false
     private var currentOverlayView: View? = null
     private var currentOverlayType: OverlayType? = null
 
-    // --- ENFORCEMENT STATE ---
-    private data class EnforcementState(
-        var warned25: Boolean = false,
-        var softBlocked50: Boolean = false,
-        var hardBlocked: Boolean = false
-    )
-    private val enforcementStates = mutableMapOf<String, EnforcementState>()
-    private var lastCheckDate: String = ""
-
-    // Event buffering
     private val scrollEventChannel = Channel<Pair<AccessibilityEvent, String>>(
         capacity = 50,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -104,8 +102,7 @@ class ScrollTrackingService : AccessibilityService() {
             repository = ScrollRepository.get(applicationContext)
             prefs = UserPreferences(applicationContext)
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-            lastCheckDate = LocalDate.now().toString()
-            enforcementStates["GLOBAL"] = EnforcementState()
+            ensureStateExists("GLOBAL")
 
             startEventConsumer()
             startPeriodicFlushing()
@@ -113,6 +110,12 @@ class ScrollTrackingService : AccessibilityService() {
             startForegroundServiceSafe()
         } catch (e: Exception) {
             Log.e("AntiDoom", "Service init error", e)
+        }
+    }
+
+    private fun ensureStateExists(key: String) {
+        if (!enforcementStates.containsKey(key)) {
+            enforcementStates[key] = EnforcementState()
         }
     }
 
@@ -128,20 +131,20 @@ class ScrollTrackingService : AccessibilityService() {
                 checkEnforcementState(source = "CONFIG")
             }
         }
+
         // Observer DB Usage
         serviceScope.launch {
             while (isActive) {
                 val today = LocalDate.now().toString()
-                if (today != lastCheckDate) {
-                    enforcementStates.clear()
-                    enforcementStates["GLOBAL"] = EnforcementState()
-                    lastCheckDate = today
-                }
                 repository.getDailyAppDistancesFlow(today)
                     .distinctUntilChanged()
                     .collectLatest { map ->
+                        // Questo aggiorna la cache con la "Verità" dal DB.
+                        // Sovrascriverà i nostri aggiornamenti ottimistici, ma va bene
+                        // perché a questo punto il DB dovrebbe essere allineato.
                         dailyAppUsageCache = map
                         currentDailyTotal = map.values.sum()
+                        checkEnforcementState(source = "DB_UPDATE")
                     }
             }
         }
@@ -163,28 +166,19 @@ class ScrollTrackingService : AccessibilityService() {
         val pkgName = event.packageName?.toString() ?: return
         if (pkgName == packageName) return
 
-        // 1. IMMUNITY CHECK (Fast Path)
-        // Se siamo nella "Deadzone" post-uscita, ignora tutto da quell'app.
-        // Questo elimina i "Ghost Events" durante l'animazione di chiusura.
-        if (pkgName == lastBlockedPackage && SystemClock.uptimeMillis() < immunityDeadline) {
-            return
-        }
+        if (pkgName == lastBlockedPackage && SystemClock.uptimeMillis() < immunityDeadline) return
 
-        // 2. WINDOW STATE (Context Switch)
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            // Se rileviamo un pacchetto diverso (es. Launcher), resettiamo immediatamente l'immunità.
-            // Questo permette il rientro rapido in altre app o nello stesso pacchetto dopo un ciclo.
             if (pkgName != lastBlockedPackage && pkgName != currentAppPackage) {
-                immunityDeadline = 0L // Reset Deadzone
+                immunityDeadline = 0L
             }
             handlePackageSwitch(pkgName)
             return
         }
 
-        // 3. SCROLLING
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             if (pkgName !in trackedAppsCache) return
-            if (isOverlayShowing) return
+            if (isOverlayShowing && currentOverlayType == OverlayType.HARD) return
 
             if (pkgName != currentAppPackage) handlePackageSwitch(pkgName)
 
@@ -193,27 +187,44 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
+    /**
+     * CRITICAL FIX: Optimistic Update
+     */
     private fun handlePackageSwitch(newPackage: String) {
         if (newPackage == currentAppPackage) return
 
-        // Flush old session
-        serviceScope.launch {
-            if (currentAppPackage.isNotEmpty() && sessionAccumulatedMeters > 0) {
-                repository.flushSessionToDb(currentAppPackage, sessionAccumulatedMeters)
+        val previousPkg = currentAppPackage
+        val metersToFlush = sessionAccumulatedMeters
+
+        if (previousPkg.isNotEmpty() && metersToFlush > 0) {
+            // 1. Aggiornamento DB Asincrono (Lento)
+            serviceScope.launch {
+                repository.flushSessionToDb(previousPkg, metersToFlush)
             }
+
+            // 2. Aggiornamento Cache LOCALE Istantaneo (Veloce)
+            // Questo chiude il "Persistence Gap". Aggiorniamo la RAM subito.
+            val currentMap = dailyAppUsageCache.toMutableMap()
+            val oldVal = currentMap[previousPkg] ?: 0f
+            currentMap[previousPkg] = oldVal + metersToFlush
+
+            // Commit atomico alla variabile volatile
+            dailyAppUsageCache = currentMap
+            currentDailyTotal += metersToFlush
         }
 
+        // Reset Sessione
         sessionAccumulatedMeters = 0f
         lastUiUpdateDistance = 0f
         repository.updateActiveDistance(0f)
         currentAppPackage = newPackage
 
-        // RE-ENTRY CHECK:
-        // Se l'utente rientra in un'app tracciata, verifichiamo subito i limiti.
+        ensureStateExists(newPackage)
+
+        // Controllo Limiti all'ingresso
         if (newPackage in trackedAppsCache) {
             checkEnforcementState(source = "WINDOW_SWITCH")
         } else {
-            // Se usciamo da un'app tracciata, rimuoviamo overlay (safe cleanup)
             if (isOverlayShowing) removeOverlaySafe()
         }
     }
@@ -222,10 +233,7 @@ class ScrollTrackingService : AccessibilityService() {
         serviceScope.launch {
             for ((event, pkgName) in scrollEventChannel) {
                 try {
-                    // Doppio controllo immunità (per eventi rimasti in coda)
-                    if (pkgName == lastBlockedPackage && SystemClock.uptimeMillis() < immunityDeadline) {
-                        continue
-                    }
+                    if (pkgName == lastBlockedPackage && SystemClock.uptimeMillis() < immunityDeadline) continue
                     processScrollEvent(event)
                 } finally {
                     try { event.recycle() } catch (_: Exception) {}
@@ -242,8 +250,8 @@ class ScrollTrackingService : AccessibilityService() {
         sessionAccumulatedMeters += meters
 
         val now = SystemClock.uptimeMillis()
-        if (now - lastUiUpdateTimestamp > UI_UPDATE_INTERVAL_MS ||
-            abs(sessionAccumulatedMeters - lastUiUpdateDistance) > MIN_DIST_TO_UPDATE_UI
+        if (abs(sessionAccumulatedMeters - lastUiUpdateDistance) > MIN_DIST_TO_UPDATE_UI ||
+            now - lastUiUpdateTimestamp > UI_UPDATE_INTERVAL_MS
         ) {
             repository.updateActiveDistance(sessionAccumulatedMeters)
             lastUiUpdateTimestamp = now
@@ -258,8 +266,9 @@ class ScrollTrackingService : AccessibilityService() {
     }
 
     /**
-     * CORE LOGIC: Valuta i limiti e applica i blocchi.
-     * Include il controllo "Reality Check" per evitare falsi positivi.
+     * LOGICA PRIORITÀ:
+     * 1. App Limit (Specifico) -> Vince su tutto.
+     * 2. Global Limit (Generico) -> Scatta se App Limit non è attivo o non raggiunto.
      */
     private fun checkEnforcementState(source: String) {
         if (currentAppPackage !in trackedAppsCache) {
@@ -267,86 +276,114 @@ class ScrollTrackingService : AccessibilityService() {
             return
         }
 
-        // Calcolo utilizzo totale
-        val currentAppUsage = (dailyAppUsageCache[currentAppPackage] ?: 0f) + sessionAccumulatedMeters
-        val currentTotalUsage = currentDailyTotal + sessionAccumulatedMeters
+        // Calcolo Dati (Cache Aggiornata Ottimisticamente + Sessione Corrente)
+        val usageGlobal = currentDailyTotal + sessionAccumulatedMeters
+        val usageApp = (dailyAppUsageCache[currentAppPackage] ?: 0f) + sessionAccumulatedMeters
+        val limitApp = appLimitsCache[currentAppPackage]
 
-        // 1. GLOBAL LIMIT
-        val globalLimit = globalLimitMeters
-        if (currentTotalUsage >= globalLimit) {
-            tryShowBlockOverlay(
+        // --- HARD BLOCK CHECK (Priorità Invertita) ---
+
+        // 1. Check APP LIMIT (Massima Priorità Specificità)
+        if (limitApp != null && usageApp >= limitApp) {
+            triggerOverlay(
+                OverlayType.HARD,
+                "⛔ APP LIMIT REACHED",
+                "Limit for this app reached.",
+                "CLOSE APP"
+            )
+            return // Blocca qui, ignora Global
+        }
+
+        // 2. Check GLOBAL LIMIT (Fallback Generico)
+        if (usageGlobal >= globalLimitMeters) {
+            triggerOverlay(
                 OverlayType.HARD,
                 "⛔ LIMIT REACHED",
-                "Global budget exhausted.",
-                "GO TO HOME",
-                currentAppPackage
+                "Global daily budget exhausted.",
+                "GO TO HOME"
             )
             return
         }
 
-        // 2. APP LIMIT
-        val appLimit = appLimitsCache[currentAppPackage]
-        if (appLimit != null) {
-            if (currentAppUsage >= appLimit) {
-                tryShowBlockOverlay(
-                    OverlayType.HARD,
-                    "⛔ APP LIMIT REACHED",
-                    "Limit for this app reached.",
-                    "CLOSE APP",
-                    currentAppPackage
-                )
-                return
-            }
-        }
+        // --- NESSUN HARD BLOCK ATTIVO ---
 
-        // Se siamo qui, i limiti sono rispettati. Se l'overlay era mostrato, rimuovilo.
-        if (isOverlayShowing) {
+        // Rimuovi Hard Overlay se i limiti non sono più superati
+        if (isOverlayShowing && currentOverlayType == OverlayType.HARD) {
             removeOverlaySafe()
         }
-    }
 
-    private fun tryShowBlockOverlay(
-        type: OverlayType,
-        title: String,
-        msg: String,
-        btn: String,
-        targetPackage: String
-    ) {
-        // Evita flickering se già mostrato
-        if (isOverlayShowing && currentOverlayType == type) return
+        // --- SOFT WARNINGS (Stateful) ---
 
-        // REALITY CHECK (LATERAL THINKING SOLUTION):
-        // Prima di bloccare, verifichiamo: "L'app target è DAVVERO la finestra attiva?"
-        // Questo interroga il sistema operativo direttamente, bypassando la coda eventi.
-        // Se stiamo ricevendo eventi fantasma mentre l'app si chiude, rootInActiveWindow
-        // sarà null (transizione) o il Launcher. NON sarà targetPackage.
-        if (!isPackageActuallyVisible(targetPackage)) {
-            Log.d("AntiDoom", "Block aborted: $targetPackage is not actually visible.")
-            return
+        // Gestione priorità anche per i Warning:
+        // Se l'app ha un limite, mostra i warning relativi all'app.
+        // Altrimenti mostra i warning globali.
+
+        var warningHandled = false
+
+        if (limitApp != null) {
+            warningHandled = checkIntermediateStates(usageApp, limitApp, currentAppPackage)
         }
 
-        showOverlay(ActionRequest(type, title, msg, btn, Color.parseColor("#F2000000")))
+        // Se non abbiamo mostrato warning specifici per l'app, controlliamo il globale
+        if (!warningHandled) {
+            checkIntermediateStates(usageGlobal, globalLimitMeters, "GLOBAL")
+        }
     }
 
     /**
-     * Verifica la "Ground Truth" chiedendo al sistema quale finestra è attiva.
-     * Costoso, da usare solo prima di applicare un blocco.
+     * Ritorna true se un warning è stato attivato/gestito
      */
+    private fun checkIntermediateStates(usage: Float, limit: Float, key: String): Boolean {
+        if (limit <= 0) return false
+
+        ensureStateExists(key)
+        val state = enforcementStates[key]!!
+        val ratio = usage / limit
+
+        if (ratio >= THRESHOLD_SOFT) {
+            if (!state.softBlocked50) {
+                state.softBlocked50 = true
+                if (!isOverlayShowing) {
+                    triggerOverlay(
+                        OverlayType.SOFT,
+                        "⚠️ 50% USED",
+                        "You have used half of your budget for ${if(key=="GLOBAL") "today" else "this app"}.",
+                        "CONTINUE"
+                    )
+                }
+            }
+            return true
+        }
+        else if (ratio >= THRESHOLD_WARN) {
+            if (!state.warned25) {
+                state.warned25 = true
+                mainHandler.post {
+                    Toast.makeText(
+                        applicationContext,
+                        "AntiDoom: 25% of ${if(key=="GLOBAL") "Global" else "App"} limit used.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            return true
+        }
+        return false
+    }
+
+    private fun triggerOverlay(type: OverlayType, title: String, msg: String, btn: String) {
+        if (!isPackageActuallyVisible(currentAppPackage)) {
+            Log.d("AntiDoom", "Overlay trigger aborted: Target not visible.")
+            return
+        }
+        showOverlay(ActionRequest(type, title, msg, btn, Color.parseColor("#F2000000")))
+    }
+
     private fun isPackageActuallyVisible(targetPkg: String): Boolean {
         return try {
             val rootNode = rootInActiveWindow
-            if (rootNode == null) {
-                // Se null, siamo in transizione o system UI. Sicuramente NON è l'app attiva stabile.
-                false
-            } else {
-                val actualPkg = rootNode.packageName?.toString()
-                // Ricicla il nodo per evitare memory leaks
-                // N.B. In alcune versioni API recycle() non è necessario ma è buona prassi
-                // rootNode.recycle() // (Commentato per sicurezza su alcune ROM custom)
-                actualPkg == targetPkg
-            }
+            if (rootNode == null) false
+            else rootNode.packageName?.toString() == targetPkg
         } catch (e: Exception) {
-            // Fallback permissivo in caso di errore API: assumiamo sia visibile per non rompere la feature
             true
         }
     }
@@ -358,6 +395,12 @@ class ScrollTrackingService : AccessibilityService() {
 
     private fun showOverlay(action: ActionRequest) {
         if (!Settings.canDrawOverlays(this)) return
+
+        // Anti-Flickering
+        if (isOverlayShowing && currentOverlayType == action.type) return
+
+        // Priority Protection: Mai sovrascrivere HARD con SOFT
+        if (isOverlayShowing && currentOverlayType == OverlayType.HARD && action.type == OverlayType.SOFT) return
 
         serviceScope.launch(Dispatchers.Main) {
             if (currentOverlayView != null) removeOverlaySafe()
@@ -432,14 +475,10 @@ class ScrollTrackingService : AccessibilityService() {
 
     private fun handleOverlayAction(type: OverlayType) {
         if (type == OverlayType.HARD) {
-            // ACTION: EXIT
-
-            // 1. Imposta Immunità/Deadzone (800ms)
-            // Qualsiasi evento da questa app sarà ignorato per 0.8s.
+            // EXIT
             lastBlockedPackage = currentAppPackage
             immunityDeadline = SystemClock.uptimeMillis() + POST_EXIT_IMMUNITY_MS
 
-            // 2. Trigger Home
             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                 addCategory(Intent.CATEGORY_HOME)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -449,12 +488,10 @@ class ScrollTrackingService : AccessibilityService() {
             } catch (e: Exception) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
-
-            // 3. Rimuovi Overlay
             removeOverlaySafe()
 
         } else {
-            // Soft dismiss
+            // SOFT DISMISS
             removeOverlaySafe()
         }
     }
@@ -479,8 +516,21 @@ class ScrollTrackingService : AccessibilityService() {
         serviceScope.launch {
             while (isActive) {
                 delay(DB_FLUSH_INTERVAL_MS)
+                // Usiamo handlePackageSwitch per flushare e aggiornare cache correttamente anche nel periodico
                 if (sessionAccumulatedMeters > 0 && currentAppPackage.isNotEmpty()) {
-                    repository.flushSessionToDb(currentAppPackage, sessionAccumulatedMeters)
+                    // Nota: Qui non cambiamo pacchetto, quindi chiamiamo repository diretto
+                    // Ma aggiorniamo anche la cache locale per coerenza
+                    val pkg = currentAppPackage
+                    val dist = sessionAccumulatedMeters
+
+                    repository.flushSessionToDb(pkg, dist)
+
+                    // Update cache optimistic
+                    val currentMap = dailyAppUsageCache.toMutableMap()
+                    currentMap[pkg] = (currentMap[pkg] ?: 0f) + dist
+                    dailyAppUsageCache = currentMap
+                    currentDailyTotal += dist
+
                     sessionAccumulatedMeters = 0f
                 }
             }
