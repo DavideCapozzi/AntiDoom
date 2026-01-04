@@ -20,9 +20,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -37,7 +39,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -52,9 +56,13 @@ import com.antidoom.app.data.ScrollRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
+import java.time.format.TextStyle
+import java.util.Locale
 
+// UPDATE: Changed Stats icon to ShowChart (Graph), maintained Home
 sealed class Screen(val route: String, val label: String? = null, val icon: ImageVector? = null) {
-    data object Stats : Screen("stats", "Stats", Icons.Filled.AutoGraph)
+    data object Home : Screen("home", "Home", Icons.Filled.Home)
+    data object Stats : Screen("stats", "Stats", Icons.AutoMirrored.Filled.ShowChart) // UPDATE: Graph Icon
     data object Settings : Screen("settings", "Settings", Icons.Filled.Settings)
     data object SettingsLimits : Screen("settings/limits")
     data object SettingsApps : Screen("settings/apps")
@@ -110,7 +118,8 @@ fun AntiDoomApp() {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
 
-    val bottomNavItems = listOf(Screen.Stats, Screen.Settings)
+    // UPDATE: Reordered items: Stats - Home - Settings (Home in Center)
+    val bottomNavItems = listOf(Screen.Stats, Screen.Home, Screen.Settings)
     val showBottomBar = bottomNavItems.any { it.route == currentDestination?.route }
 
     MaterialTheme {
@@ -121,7 +130,8 @@ fun AntiDoomApp() {
                         bottomNavItems.forEach { screen ->
                             NavigationBarItem(
                                 icon = { Icon(screen.icon!!, contentDescription = screen.label) },
-                                label = { Text(screen.label!!) },
+                                // UPDATE: Labels removed by not providing a Text composable or string
+                                label = null,
                                 selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
                                 onClick = {
                                     navController.navigate(screen.route) {
@@ -138,9 +148,10 @@ fun AntiDoomApp() {
         ) { innerPadding ->
             NavHost(
                 navController = navController,
-                startDestination = Screen.Stats.route,
+                startDestination = Screen.Home.route,
                 modifier = Modifier.padding(innerPadding)
             ) {
+                composable(Screen.Home.route) { HomeScreen() }
                 composable(Screen.Stats.route) { StatsScreen() }
                 composable(Screen.Settings.route) { SettingsScreen(navController) }
                 composable(Screen.SettingsLimits.route) { LimitSettingsScreen(navController) }
@@ -152,7 +163,7 @@ fun AntiDoomApp() {
 }
 
 @Composable
-fun StatsScreen() {
+fun HomeScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var currentDate by remember { mutableStateOf(LocalDate.now().toString()) }
@@ -178,13 +189,108 @@ fun StatsScreen() {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("AntiDoom Tracker", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
+        Text("AntiDoom", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
         Spacer(modifier = Modifier.height(48.dp))
         Text(
             text = String.format(java.util.Locale.US, "%.2f m", todayDistance),
             style = MaterialTheme.typography.displayLarge.copy(fontWeight = FontWeight.Bold)
         )
         Text("Scrolled Today", style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+// UPDATE: StatsScreen with Bar Chart
+@Composable
+fun StatsScreen() {
+    val context = LocalContext.current
+    val repository = remember { ScrollRepository.get(context) }
+
+    // Fetch last 7 days stats
+    val weeklyStats by repository.getLast7DaysStats().collectAsState(initial = emptyList())
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("Weekly Trends", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
+        Spacer(modifier = Modifier.height(32.dp))
+
+        if (weeklyStats.isEmpty()) {
+            Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else {
+            // Chart Container
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp)
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                // Find max value for scaling (min 10m to avoid division by zero or huge bars for small data)
+                val maxVal = weeklyStats.maxOfOrNull { it.total }?.coerceAtLeast(10f) ?: 10f
+
+                // Prepare data for the last 7 days (fill missing days with 0)
+                val chartData = remember(weeklyStats) {
+                    val end = LocalDate.now()
+                    (0..6).map { i ->
+                        val date = end.minusDays(6L - i)
+                        val dateStr = date.toString()
+                        val value = weeklyStats.find { it.date == dateStr }?.total ?: 0f
+                        val dayLabel = date.dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.getDefault()).take(1)
+                        Triple(dayLabel, value, value / maxVal)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(200.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    chartData.forEach { (label, value, fraction) ->
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Bottom,
+                            modifier = Modifier.weight(1f).fillMaxHeight()
+                        ) {
+                            // Value Text (if enough space)
+                            if (fraction > 0.1f) {
+                                Text(
+                                    text = "${value.toInt()}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            // The Bar
+                            Box(
+                                modifier = Modifier
+                                    .width(12.dp)
+                                    .fillMaxHeight(fraction.coerceAtLeast(0.02f)) // Min height for visibility
+                                    .clip(RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp))
+                                    .background(MaterialTheme.colorScheme.primary)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Day Label
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text("Last 7 Days (Meters)", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        }
     }
 }
 
@@ -314,28 +420,20 @@ fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
 fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val density = LocalDensity.current.density
-
-    // Fixed target size for consistent memory usage (approx 48dp)
     val targetSizePx = (48f * density).toInt().coerceAtLeast(64)
 
     val bitmapState = produceState<Bitmap?>(initialValue = null, key1 = packageName) {
-        // Fast path: Memory Cache
         val cached = IconCache.get(packageName)
         if (cached != null) {
             value = cached
             return@produceState
         }
-
-        // Slow path: Background Rasterization
         value = withContext(Dispatchers.IO) {
             try {
                 val drawable = context.packageManager.getApplicationIcon(packageName)
-
-                // Downsample logic
                 if (drawable is BitmapDrawable &&
                     drawable.bitmap.width <= targetSizePx &&
                     drawable.bitmap.height <= targetSizePx) {
-
                     IconCache.put(packageName, drawable.bitmap)
                     drawable.bitmap
                 } else {
@@ -343,7 +441,6 @@ fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
                     val canvas = Canvas(bitmap)
                     drawable.setBounds(0, 0, canvas.width, canvas.height)
                     drawable.draw(canvas)
-
                     IconCache.put(packageName, bitmap)
                     bitmap
                 }
@@ -360,7 +457,6 @@ fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
             modifier = modifier
         )
     } else {
-        // Placeholder prevents layout jump
         Box(
             modifier = modifier
                 .background(Color.LightGray.copy(alpha = 0.3f), CircleShape)

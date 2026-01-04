@@ -45,6 +45,12 @@ data class AppDistanceTuple(
     @ColumnInfo(name = "total") val total: Float
 )
 
+// NEW: Data class for Weekly Chart
+data class DailyTotalTuple(
+    @ColumnInfo(name = "date") val date: String,
+    @ColumnInfo(name = "total") val total: Float
+)
+
 // --- DAO ---
 @Dao
 interface ScrollDao {
@@ -56,6 +62,16 @@ interface ScrollDao {
 
     @Query("SELECT packageName, COALESCE(SUM(distanceMeters), 0) as total FROM scroll_sessions WHERE date = :date GROUP BY packageName")
     fun getDailyBreakdown(date: String): Flow<List<AppDistanceTuple>>
+
+    // NEW: Get daily totals for the last 7 days for the chart
+    @Query("""
+        SELECT date, COALESCE(SUM(distanceMeters), 0) as total 
+        FROM scroll_sessions 
+        GROUP BY date 
+        ORDER BY date DESC 
+        LIMIT 7
+    """)
+    fun getLast7DaysTotals(): Flow<List<DailyTotalTuple>>
 
     @Query("""
         INSERT OR REPLACE INTO daily_app_history (date, packageName, totalMeters)
@@ -180,13 +196,10 @@ class UserPreferences private constructor(private val context: Context) {
         }
     }
 
-    // Format is "pkg1:limit1,pkg2:limit2"
     private fun parseAppLimitsOptimized(raw: String): Map<String, Float> {
         if (raw.isEmpty() || raw == "{}") return emptyMap()
 
-        // Handle legacy JSON case if needed, otherwise stick to simple string splitting
         if (raw.startsWith("{") && raw.contains("\"")) {
-            // Fallback for legacy JSON data
             return try {
                 val map = mutableMapOf<String, Float>()
                 val jsonObj = org.json.JSONObject(raw)
@@ -197,7 +210,6 @@ class UserPreferences private constructor(private val context: Context) {
             } catch (e: Exception) { emptyMap() }
         }
 
-        // Fast path string parsing
         val map = mutableMapOf<String, Float>()
         val entries = raw.split(',')
         for (entry in entries) {
@@ -239,6 +251,14 @@ class ScrollRepository private constructor(context: Context) {
             .combine(_activeSessionDistance) { dbTotal, ramTotal ->
                 dbTotal + ramTotal
             }
+    }
+
+    // NEW: Expose weekly stats
+    fun getLast7DaysStats(): Flow<List<DailyTotalTuple>> {
+        return db.scrollDao().getLast7DaysTotals()
+        // Note: We are not combining with _activeSessionDistance here to keep it simple
+        // and because historical days don't change.
+        // For "Today", it might lag slightly behind the live counter on Home, which is acceptable for a generic chart.
     }
 
     fun updateActiveDistance(meters: Float) {
