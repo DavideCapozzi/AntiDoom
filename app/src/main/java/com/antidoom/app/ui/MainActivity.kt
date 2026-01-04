@@ -5,16 +5,21 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.LruCache
 import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
@@ -23,9 +28,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -39,13 +48,11 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import coil.compose.rememberAsyncImagePainter
 import com.antidoom.app.data.ScrollRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
 
-// Navigation Routes
 sealed class Screen(val route: String, val label: String? = null, val icon: ImageVector? = null) {
     data object Stats : Screen("stats", "Stats", Icons.Filled.AutoGraph)
     data object Settings : Screen("settings", "Settings", Icons.Filled.Settings)
@@ -54,11 +61,25 @@ sealed class Screen(val route: String, val label: String? = null, val icon: Imag
     data object SettingsAccessibility : Screen("settings/accessibility")
 }
 
-// Shared Data Model
 data class AppInfo(
     val label: String,
     val packageName: String
 )
+
+// Optimized LRU Cache for Bitmaps
+object IconCache {
+    private val maxMemory = (Runtime.getRuntime().maxMemory() / 1024).toInt()
+    private val cacheSize = maxMemory / 8
+
+    private val memoryCache = object : LruCache<String, Bitmap>(cacheSize) {
+        override fun sizeOf(key: String, bitmap: Bitmap): Int {
+            return bitmap.byteCount / 1024
+        }
+    }
+
+    fun get(key: String): Bitmap? = memoryCache.get(key)
+    fun put(key: String, bitmap: Bitmap) { memoryCache.put(key, bitmap) }
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -146,7 +167,6 @@ fun StatsScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Optimization: remember repository instance
     val repository = remember { ScrollRepository.get(context) }
 
     val todayDistance by key(currentDate) {
@@ -289,31 +309,62 @@ fun SetupButton(text: String, isEnabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-// --- OPTIMIZED ICON LOADER ---
+// Optimized Async Icon Loader
 @Composable
 fun PackageIcon(packageName: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val density = LocalDensity.current.density
 
-    // Asynchronously load the icon to prevent Main Thread blocking
-    val iconState = produceState<Drawable?>(initialValue = null, key1 = packageName) {
+    // Fixed target size for consistent memory usage (approx 48dp)
+    val targetSizePx = (48f * density).toInt().coerceAtLeast(64)
+
+    val bitmapState = produceState<Bitmap?>(initialValue = null, key1 = packageName) {
+        // Fast path: Memory Cache
+        val cached = IconCache.get(packageName)
+        if (cached != null) {
+            value = cached
+            return@produceState
+        }
+
+        // Slow path: Background Rasterization
         value = withContext(Dispatchers.IO) {
             try {
-                context.packageManager.getApplicationIcon(packageName)
+                val drawable = context.packageManager.getApplicationIcon(packageName)
+
+                // Downsample logic
+                if (drawable is BitmapDrawable &&
+                    drawable.bitmap.width <= targetSizePx &&
+                    drawable.bitmap.height <= targetSizePx) {
+
+                    IconCache.put(packageName, drawable.bitmap)
+                    drawable.bitmap
+                } else {
+                    val bitmap = Bitmap.createBitmap(targetSizePx, targetSizePx, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(bitmap)
+                    drawable.setBounds(0, 0, canvas.width, canvas.height)
+                    drawable.draw(canvas)
+
+                    IconCache.put(packageName, bitmap)
+                    bitmap
+                }
             } catch (e: Exception) {
-                ContextCompat.getDrawable(context, android.R.drawable.sym_def_app_icon)
+                null
             }
         }
     }
 
-    if (iconState.value != null) {
+    if (bitmapState.value != null) {
         Image(
-            painter = rememberAsyncImagePainter(iconState.value),
+            painter = BitmapPainter(bitmapState.value!!.asImageBitmap()),
             contentDescription = null,
             modifier = modifier
         )
     } else {
-        // Placeholder to maintain layout stability
-        Box(modifier = modifier)
+        // Placeholder prevents layout jump
+        Box(
+            modifier = modifier
+                .background(Color.LightGray.copy(alpha = 0.3f), CircleShape)
+        )
     }
 }
 

@@ -15,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import com.antidoom.app.data.UserPreferences
@@ -53,7 +54,7 @@ fun AppsSettingsScreen(navController: NavController) {
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
-            // Optimization: We do NOT load Drawables here anymore to save memory
+
             val apps = pm.queryIntentActivities(intent, 0)
                 .map { resolveInfo ->
                     AppInfo(
@@ -88,7 +89,7 @@ fun AppsSettingsScreen(navController: NavController) {
                 },
                 actions = {
                     if (isLocked) {
-                        IconButton(onClick = { Toast.makeText(context, "Selection locked by active timer", Toast.LENGTH_SHORT).show() }) {
+                        IconButton(onClick = { Toast.makeText(context, "Selection locked", Toast.LENGTH_SHORT).show() }) {
                             Icon(Icons.Default.Lock, "Locked", tint = Color.Red)
                         }
                     }
@@ -101,56 +102,63 @@ fun AppsSettingsScreen(navController: NavController) {
                 CircularProgressIndicator()
             }
         } else {
-            LazyColumn(modifier = Modifier.padding(p)) {
-                // SECTION 1: CORE APPS
+            LazyColumn(
+                modifier = Modifier.padding(p),
+                // Optimization: Keep loaded items in memory slightly longer
+                contentPadding = PaddingValues(bottom = 16.dp)
+            ) {
+
                 if (coreAppsList.isNotEmpty()) {
                     item {
-                        Surface(color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                "Core Doomscrolling Apps",
-                                modifier = Modifier.padding(16.dp),
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            )
-                        }
+                        SectionHeader(title = "Core Doomscrolling Apps", color = MaterialTheme.colorScheme.primaryContainer)
                     }
-                    items(coreAppsList, key = { it.packageName }) { app ->
-                        AppItem(app, app.packageName in trackedApps, isLocked) { isChecked ->
-                            if (isLocked) {
-                                Toast.makeText(context, "Locked: Cannot change apps while timer is active", Toast.LENGTH_SHORT).show()
-                                return@AppItem
+                    items(
+                        items = coreAppsList,
+                        key = { it.packageName },
+                        contentType = { "app_item" }
+                    ) { app ->
+                        AppItem(
+                            app = app,
+                            isTracked = app.packageName in trackedApps,
+                            isLocked = isLocked,
+                            onToggle = {
+                                if (!isLocked) {
+                                    scope.launch {
+                                        val newSet = if (it) trackedApps + app.packageName else trackedApps - app.packageName
+                                        prefs.updateTrackedApps(newSet)
+                                    }
+                                } else {
+                                    Toast.makeText(context, "Locked: Cannot change apps", Toast.LENGTH_SHORT).show()
+                                }
                             }
-                            scope.launch {
-                                val newSet = if (isChecked) trackedApps + app.packageName else trackedApps - app.packageName
-                                prefs.updateTrackedApps(newSet)
-                            }
-                        }
-                    }
-                }
-
-                // SECTION 2: OTHER APPS
-                item {
-                    Surface(color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            "Other Apps (Optional)",
-                            modifier = Modifier.padding(16.dp),
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     }
                 }
 
-                items(otherAppsList, key = { it.packageName }) { app ->
-                    AppItem(app, app.packageName in trackedApps, isLocked) { isChecked ->
-                        if (isLocked) {
-                            Toast.makeText(context, "Locked: Cannot change apps while timer is active", Toast.LENGTH_SHORT).show()
-                            return@AppItem
+                item {
+                    SectionHeader(title = "Other Apps (Optional)", color = MaterialTheme.colorScheme.secondaryContainer)
+                }
+
+                items(
+                    items = otherAppsList,
+                    key = { it.packageName },
+                    contentType = { "app_item" }
+                ) { app ->
+                    AppItem(
+                        app = app,
+                        isTracked = app.packageName in trackedApps,
+                        isLocked = isLocked,
+                        onToggle = {
+                            if (!isLocked) {
+                                scope.launch {
+                                    val newSet = if (it) trackedApps + app.packageName else trackedApps - app.packageName
+                                    prefs.updateTrackedApps(newSet)
+                                }
+                            } else {
+                                Toast.makeText(context, "Locked: Cannot change apps", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                        scope.launch {
-                            val newSet = if (isChecked) trackedApps + app.packageName else trackedApps - app.packageName
-                            prefs.updateTrackedApps(newSet)
-                        }
-                    }
+                    )
                 }
             }
         }
@@ -158,27 +166,58 @@ fun AppsSettingsScreen(navController: NavController) {
 }
 
 @Composable
-fun AppItem(app: AppInfo, isTracked: Boolean, isLocked: Boolean, onToggle: (Boolean) -> Unit) {
-    ListItem(
-        headlineContent = { Text(app.label) },
-        leadingContent = {
-            // Using the new helper composable for memory efficiency
-            PackageIcon(
-                packageName = app.packageName,
-                modifier = Modifier.size(40.dp)
+fun SectionHeader(title: String, color: Color) {
+    Surface(color = color, modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = title,
+            modifier = Modifier.padding(16.dp),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.contentColorFor(color)
+        )
+    }
+}
+
+// Lightweight Row implementation replacing ListItem
+@Composable
+fun AppItem(
+    app: AppInfo,
+    isTracked: Boolean,
+    isLocked: Boolean,
+    onToggle: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(64.dp) // Fixed height helps measurement
+            .clickable { onToggle(!isTracked) }
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        PackageIcon(
+            packageName = app.packageName,
+            modifier = Modifier.size(40.dp)
+        )
+
+        Spacer(modifier = Modifier.width(16.dp))
+
+        Text(
+            text = app.label,
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        Checkbox(
+            checked = isTracked,
+            onCheckedChange = onToggle,
+            enabled = !isLocked,
+            colors = CheckboxDefaults.colors(
+                disabledCheckedColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
             )
-        },
-        trailingContent = {
-            Checkbox(
-                checked = isTracked,
-                onCheckedChange = onToggle,
-                enabled = !isLocked,
-                colors = CheckboxDefaults.colors(
-                    disabledCheckedColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
-                )
-            )
-        },
-        modifier = Modifier.clickable { onToggle(!isTracked) }
-    )
-    HorizontalDivider(thickness = 0.5.dp, color = Color.LightGray)
+        )
+    }
+    HorizontalDivider(thickness = 0.5.dp, color = Color.LightGray.copy(alpha = 0.5f))
 }
