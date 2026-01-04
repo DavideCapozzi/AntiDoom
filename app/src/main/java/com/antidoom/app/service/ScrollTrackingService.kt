@@ -59,7 +59,7 @@ class ScrollTrackingService : AccessibilityService() {
         var softBlocked50: Boolean = false
     )
 
-    // Optimized: ConcurrentHashMap for thread safety without explicit locks
+    // ConcurrentHashMap allows thread-safe access without explicit synchronized blocks
     private val enforcementStates = ConcurrentHashMap<String, EnforcementState>()
 
     private val serviceJob = SupervisorJob()
@@ -73,7 +73,6 @@ class ScrollTrackingService : AccessibilityService() {
     @Volatile private var appLimitsCache: Map<String, Float> = emptyMap()
     @Volatile private var globalLimitMeters: Float = 100f
 
-    // Optimized: ConcurrentHashMap for cache
     private val dailyAppUsageCache = ConcurrentHashMap<String, Float>()
     @Volatile private var currentDailyTotal: Float = 0f
 
@@ -104,7 +103,9 @@ class ScrollTrackingService : AccessibilityService() {
             repository = ScrollRepository.get(applicationContext)
             prefs = UserPreferences.get(applicationContext)
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-            ensureStateExists("GLOBAL")
+
+            // Pre-initialize global state
+            enforcementStates["GLOBAL"] = EnforcementState()
 
             createReusableOverlayView()
 
@@ -115,10 +116,6 @@ class ScrollTrackingService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e("AntiDoom", "Service init error", e)
         }
-    }
-
-    private fun ensureStateExists(key: String) {
-        enforcementStates.computeIfAbsent(key) { EnforcementState() }
     }
 
     private fun startStateObservation() {
@@ -165,6 +162,7 @@ class ScrollTrackingService : AccessibilityService() {
         val pkgName = event.packageName?.toString() ?: return
         if (pkgName == packageName) return
 
+        // OPTIMIZATION: Check immunity first to avoid logic
         if (pkgName == lastBlockedPackage && SystemClock.uptimeMillis() < immunityDeadline) return
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
@@ -176,11 +174,14 @@ class ScrollTrackingService : AccessibilityService() {
         }
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            if (pkgName !in trackedAppsCache) return
+            // OPTIMIZATION: Early exit if Hard Locked. Don't process scroll events at all.
             if (isOverlayShowing && currentOverlayType == OverlayType.HARD) return
+
+            if (pkgName !in trackedAppsCache) return
 
             if (pkgName != currentAppPackage) handlePackageSwitch(pkgName)
 
+            // Copy and send only if we passed checks
             val eventCopy = AccessibilityEvent.obtain(event)
             scrollEventChannel.trySend(eventCopy to pkgName)
         }
@@ -206,7 +207,8 @@ class ScrollTrackingService : AccessibilityService() {
         repository.updateActiveDistance(0f)
         currentAppPackage = newPackage
 
-        ensureStateExists(newPackage)
+        // Ensure state exists for the new app immediately
+        enforcementStates.computeIfAbsent(newPackage) { EnforcementState() }
 
         if (newPackage in trackedAppsCache) {
             checkEnforcementState(source = "WINDOW_SWITCH")
@@ -219,6 +221,7 @@ class ScrollTrackingService : AccessibilityService() {
         serviceScope.launch {
             for ((event, pkgName) in scrollEventChannel) {
                 try {
+                    // Double check immunity in consumer thread
                     if (pkgName == lastBlockedPackage && SystemClock.uptimeMillis() < immunityDeadline) continue
                     processScrollEvent(event)
                 } finally {
@@ -299,15 +302,22 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
+    // OPTIMIZATION: Reduced overhead for map lookups
     private fun checkIntermediateStates(usage: Float, limit: Float, key: String): Boolean {
         if (limit <= 0) return false
 
-        ensureStateExists(key)
-        val state = enforcementStates[key]!!
+        // Fast path: direct read without computeIfAbsent lock
+        var state = enforcementStates[key]
+        if (state == null) {
+            // Slow path: create if missing (rare case in loop)
+            state = EnforcementState()
+            enforcementStates[key] = state
+        }
+
         val ratio = usage / limit
 
         if (ratio >= THRESHOLD_SOFT) {
-            if (!state.softBlocked50) {
+            if (!state!!.softBlocked50) {
                 state.softBlocked50 = true
                 if (!isOverlayShowing) {
                     triggerOverlay(
@@ -321,7 +331,7 @@ class ScrollTrackingService : AccessibilityService() {
             return true
         }
         else if (ratio >= THRESHOLD_WARN) {
-            if (!state.warned25) {
+            if (!state!!.warned25) {
                 state.warned25 = true
                 mainHandler.post {
                     Toast.makeText(
@@ -402,7 +412,6 @@ class ScrollTrackingService : AccessibilityService() {
     private fun showOverlay(action: ActionRequest) {
         if (!Settings.canDrawOverlays(this)) return
 
-        // Prevent flicker by checking existing overlay type
         if (isOverlayShowing && currentOverlayType == action.type) return
         if (isOverlayShowing && currentOverlayType == OverlayType.HARD && action.type == OverlayType.SOFT) return
 
@@ -416,7 +425,6 @@ class ScrollTrackingService : AccessibilityService() {
             cachedBtn?.text = action.btnText
             cachedBtn?.setOnClickListener { handleOverlayAction(action.type) }
 
-            // Logic maintained: Remove before Add (proven stable)
             if (view.isAttachedToWindow) {
                 try { windowManager.removeView(view) } catch (_: Exception) {}
             }
