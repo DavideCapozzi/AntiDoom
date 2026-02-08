@@ -35,6 +35,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.onEach
 import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
@@ -118,7 +121,9 @@ class ScrollTrackingService : AccessibilityService() {
         }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     private fun startStateObservation() {
+        // 1. Observe User Preferences
         serviceScope.launch {
             combine(prefs.trackedApps, prefs.dailyLimit, prefs.appLimits) { apps, gl, al ->
                 Triple(apps, gl, al)
@@ -130,19 +135,41 @@ class ScrollTrackingService : AccessibilityService() {
             }
         }
 
+        // 2. Observe Daily Usage from DB (Fixed for Midnight Reset)
         serviceScope.launch {
-            while (isActive) {
-                val today = LocalDate.now().toString()
-                repository.getDailyAppDistancesFlow(today)
-                    .distinctUntilChanged()
-                    .collectLatest { map ->
-                        map.forEach { (pkg, dist) ->
-                            dailyAppUsageCache[pkg] = dist
-                        }
-                        currentDailyTotal = map.values.sum()
-                        checkEnforcementState(source = "DB_UPDATE")
+            // Create a flow that emits the current date and updates periodically
+            val currentDateFlow = flow {
+                var lastEmittedDate: String? = null
+                while (currentCoroutineContext().isActive) {
+                    val today = LocalDate.now().toString()
+                    if (today != lastEmittedDate) {
+                        emit(today)
+                        lastEmittedDate = today
                     }
+                    // Check for date change every minute
+                    delay(60_000L)
+                }
             }
+
+            currentDateFlow
+                .onEach {
+                    // Date changed: Clear enforcement states to allow warnings to trigger again
+                    enforcementStates.clear()
+                    enforcementStates["GLOBAL"] = EnforcementState()
+                }
+                .flatMapLatest { today ->
+                    // Switch to observing the new date's data
+                    repository.getDailyAppDistancesFlow(today)
+                }
+                .distinctUntilChanged()
+                .collectLatest { map ->
+                    // Full sync of cache maps to remove entries from previous days if necessary
+                    dailyAppUsageCache.clear()
+                    dailyAppUsageCache.putAll(map)
+
+                    currentDailyTotal = map.values.sum()
+                    checkEnforcementState(source = "DB_UPDATE")
+                }
         }
     }
 
